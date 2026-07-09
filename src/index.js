@@ -1,0 +1,1465 @@
+// fallmortgagepaper SDK · sovereign single-file library · MIT · AI-Native Solutions
+// Extracted from fallmortgagepaper/index.html · 126244 bytes of source logic
+// Public-safe: no primes/glyphs/dyad references
+
+/*!
+ * Fall Kit · v1.0.0 · the shared cascade for every estate seed
+ *
+ * Inlineable JS module. Drop into any seed via <script> or copy-paste inline.
+ * Preserves single-HTML sovereignty (no external deps until user opts in to T2 WebLLM).
+ *
+ * What it gives every seed:
+ *  - AI tier picker: T0 (off · default) · T2 (WebLLM in-browser, 5 models 1B-70B) · T3 (BYOK Anthropic/OpenAI/Google)
+ *  - Universal entry: FallKit.aiComplete(systemPrompt, userMsg, maxTokens) → string|null
+ *  - AI chip UI in header
+ *  - WebRTC P2P mesh (ported from canonical fallnet · fall-signal channel · Google STUN)
+ *  - Help section partial: FallKit.helpSection()
+ *  - Settings panel: FallKit.openSettings()
+ *
+ * Doctrine (per botler CLAUDE.md):
+ *  - T0 fallback ALWAYS works · aiComplete returns null · caller MUST degrade gracefully
+ *  - NEVER hide a feature behind AI · NEVER proxy API keys · NEVER log keys
+ *  - WebLLM is lazy-loaded · model weights download ONLY on user opt-in
+ *
+ * Estate-first canonical references:
+ *  - WebLLM pattern: Downloads/botler/index.html (T0/T2/T3 cascade)
+ *  - WebRTC pattern: Downloads/fallnet/fallnet-shim.js (raw RTCPeerConnection)
+ *  - Mesh channel:   'fall-signal'
+ */
+(function (root) {
+  'use strict';
+  const FALL_KIT_VERSION = '1.2.0';
+  const KCC_MINT_URL = 'https://sjgant80-hub.github.io/kcc-mint/';
+  // ─── Model registry ──────────────────────────────────────────────
+  const WEBLLM_MODELS = {
+    'llama-1b':  { id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC',   size: '~700MB', label: '1B · fast · any laptop / phone' },
+    'llama-3b':  { id: 'Llama-3.2-3B-Instruct-q4f16_1-MLC',   size: '~2GB',   label: '3B · balanced · default · most laptops' },
+    'qwen-7b':   { id: 'Qwen2.5-7B-Instruct-q4f16_1-MLC',     size: '~5GB',   label: '7B · capable · needs decent GPU (M-series Mac / 8GB+ VRAM)' },
+    'llama-8b':  { id: 'Llama-3.1-8B-Instruct-q4f16_1-MLC',   size: '~5GB',   label: '8B · common · needs decent GPU' },
+    'llama-70b': { id: 'Llama-3.1-70B-Instruct-q4f16_1-MLC',  size: '~40GB',  label: '70B · frontier · needs serious GPU + 64GB+ RAM' },
+  };
+  const DEFAULT_MODEL = 'llama-3b';
+  const T3_PROVIDERS = {
+    anthropic: { label: 'Anthropic Claude', models: ['claude-sonnet-4-5','claude-opus-4-7','claude-haiku-4-5'], default: 'claude-sonnet-4-5', url: 'https://api.anthropic.com/v1/messages' },
+    openai:    { label: 'OpenAI',           models: ['gpt-4o','gpt-4o-mini','o1-mini'],                          default: 'gpt-4o-mini',      url: 'https://api.openai.com/v1/chat/completions' },
+    google:    { label: 'Google Gemini',    models: ['gemini-1.5-pro','gemini-1.5-flash','gemini-2.0-flash-exp'], default: 'gemini-1.5-flash', url: 'https://generativelanguage.googleapis.com/v1beta/models/' },
+  };
+  // ─── State ───────────────────────────────────────────────────────
+  const STATE = {
+    config: loadConfig(),
+    ai: { ready: false, loading: false, progress: 0, engine: null, model: null },
+    mesh: { active: false, peers: new Map(), bc: null, signal: null },
+  };
+  function loadConfig() {
+    try { return JSON.parse(localStorage.getItem('fall-kit.config') || '{}'); }
+    catch (e) { return {}; }
+  }
+  function saveConfig() {
+    try { localStorage.setItem('fall-kit.config', JSON.stringify(STATE.config)); } catch (e) {}
+  }
+  // ─── DOM helpers ─────────────────────────────────────────────────
+  function $(s, root) { return (root || document).querySelector(s); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+  // ─── AI tier ─────────────────────────────────────────────────────
+  function aiTier() { return STATE.config.ai_tier || 'T0'; }
+  function renderAiChip() {
+    const chip = $('#fk-ai-chip');
+    if (!chip) return;
+    const txt = $('#fk-ai-chip-text');
+    chip.classList.remove('fk-chip-live', 'fk-chip-loading', 'fk-chip-warn');
+    const tier = aiTier();
+    if (tier === 'T0') { txt.textContent = 'T0 · off'; }
+    else if (tier === 'T2') {
+      if (STATE.ai.ready) { txt.textContent = 'T2 ' + (WEBLLM_MODELS[STATE.config.webllm_model || DEFAULT_MODEL]?.label.split(' · ')[0] || '') + ' · ready'; chip.classList.add('fk-chip-live'); }
+      else if (STATE.ai.loading) { txt.textContent = 'T2 loading ' + Math.round(STATE.ai.progress) + '%'; chip.classList.add('fk-chip-loading'); }
+      else { txt.textContent = 'T2 · click to load'; chip.classList.add('fk-chip-warn'); }
+    } else if (tier === 'T3') {
+      if (STATE.config.api_key) { txt.textContent = 'T3 ' + (T3_PROVIDERS[STATE.config.api_provider]?.label || 'BYOK') + ' · active'; chip.classList.add('fk-chip-live'); }
+      else { txt.textContent = 'T3 · no key set'; chip.classList.add('fk-chip-warn'); }
+    }
+  }
+  async function loadWebLLM(modelKey) {
+    if (STATE.ai.loading) return;
+    const key = modelKey || STATE.config.webllm_model || DEFAULT_MODEL;
+    const model = WEBLLM_MODELS[key];
+    if (!model) { console.error('fall-kit: unknown model', key); return; }
+    if (STATE.ai.ready && STATE.ai.model === model.id) return;
+    STATE.ai.loading = true; STATE.ai.progress = 0; renderAiChip();
+    notify('Loading WebLLM · ' + model.label + ' · ' + model.size + ' first time', 'info');
+    try {
+      const { CreateMLCEngine } = await import('https://esm.run/@mlc-ai/web-llm@0.2.79');
+      const engine = await CreateMLCEngine(model.id, {
+        initProgressCallback: p => { STATE.ai.progress = (p.progress || 0) * 100; renderAiChip(); }
+      });
+      STATE.ai.engine = engine;
+      STATE.ai.model = model.id;
+      STATE.ai.ready = true;
+      STATE.ai.loading = false;
+      STATE.config.webllm_model = key; saveConfig();
+      renderAiChip();
+      notify('WebLLM ready · sovereign mode · ' + model.label.split(' · ')[0], 'ok');
+    } catch (e) {
+      console.error('fall-kit: WebLLM load failed', e);
+      STATE.ai.loading = false; renderAiChip();
+      notify('WebLLM load failed · ' + e.message, 'err');
+    }
+  }
+  async function aiComplete(systemPrompt, userMsg, maxTokens) {
+    maxTokens = maxTokens || 600;
+    const tier = aiTier();
+    if (tier === 'T2' && STATE.ai.ready && STATE.ai.engine) {
+      const r = await STATE.ai.engine.chat.completions.create({
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMsg }],
+        max_tokens: maxTokens,
+      });
+      return r.choices[0].message.content;
+    }
+    if (tier === 'T3' && STATE.config.api_key && STATE.config.api_provider) {
+      return await aiCloudCall(systemPrompt, userMsg, maxTokens);
+    }
+    return null;
+  }
+  async function aiCloudCall(sys, msg, maxTokens) {
+    const provider = STATE.config.api_provider;
+    const key = STATE.config.api_key;
+    const model = STATE.config.api_model || T3_PROVIDERS[provider]?.default;
+    if (provider === 'anthropic') {
+      const r = await fetch(T3_PROVIDERS.anthropic.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model, max_tokens: maxTokens, system: sys, messages: [{ role: 'user', content: msg }] }),
+      });
+      if (!r.ok) throw new Error('Anthropic ' + r.status + ': ' + (await r.text()).slice(0, 200));
+      const j = await r.json();
+      return j.content[0].text;
+    }
+    if (provider === 'openai') {
+      const r = await fetch(T3_PROVIDERS.openai.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'Authorization': 'Bearer ' + key },
+        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'system', content: sys }, { role: 'user', content: msg }] }),
+      });
+      if (!r.ok) throw new Error('OpenAI ' + r.status);
+      const j = await r.json();
+      return j.choices[0].message.content;
+    }
+    if (provider === 'google') {
+      const r = await fetch(T3_PROVIDERS.google.url + model + ':generateContent?key=' + encodeURIComponent(key), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: sys + '\n\n---\n\n' + msg }] }], generationConfig: { maxOutputTokens: maxTokens } }),
+      });
+      if (!r.ok) throw new Error('Google ' + r.status);
+      const j = await r.json();
+      return j.candidates[0].content.parts[0].text;
+    }
+    throw new Error('unknown provider: ' + provider);
+  }
+  // ─── WebRTC P2P mesh (ported from canonical fallnet · fall-signal channel · Google STUN) ───
+  const MESH_CHANNEL = 'fall-signal';
+  const STUN_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
+  function meshStart(opts) {
+    if (STATE.mesh.active) return;
+    opts = opts || {};
+    const seedId = opts.seedId || (location.pathname + '#' + Math.random().toString(36).slice(2, 8));
+    STATE.mesh.seedId = seedId;
+    try { STATE.mesh.bc = new BroadcastChannel(MESH_CHANNEL); }
+    catch (e) { console.warn('fall-kit: BroadcastChannel unavailable'); return; }
+    STATE.mesh.bc.onmessage = e => {
+      const m = e.data;
+      if (!m || !m.kind || m.peerId === seedId) return;
+      if (opts.onMessage) opts.onMessage(m);
+    };
+    STATE.mesh.bc.postMessage({ kind: 'fall-kit:hello', peerId: seedId, ts: Date.now(), seedName: opts.seedName || 'unknown' });
+    STATE.mesh.active = true;
+    notify('Mesh active · channel ' + MESH_CHANNEL, 'ok');
+  }
+  function meshPost(kind, payload) {
+    if (!STATE.mesh.active || !STATE.mesh.bc) return false;
+    STATE.mesh.bc.postMessage({ kind: kind, peerId: STATE.mesh.seedId, ts: Date.now(), payload: payload });
+    return true;
+  }
+  // ─── Toast ───────────────────────────────────────────────────────
+  function notify(msg, kind) {
+    let t = $('#fk-toast');
+    if (!t) {
+      t = document.createElement('div'); t.id = 'fk-toast';
+      t.style.cssText = 'position:fixed;bottom:18px;left:50%;transform:translateX(-50%) translateY(20px);background:#c08a3a;color:#0a0a0a;padding:9px 18px;border-radius:3px;font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;opacity:0;transition:all .22s;z-index:10000;pointer-events:none';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.style.background = kind === 'err' ? '#a14a2a' : kind === 'ok' ? '#6b8d4a' : '#c08a3a';
+    t.style.color = kind === 'err' ? '#fff' : '#0a0a0a';
+    t.style.opacity = '1';
+    t.style.transform = 'translateX(-50%) translateY(0)';
+    clearTimeout(t._to);
+    t._to = setTimeout(() => { t.style.opacity = '0'; t.style.transform = 'translateX(-50%) translateY(20px)'; }, 2400);
+  }
+  // ─── Settings modal ──────────────────────────────────────────────
+  function openSettings() {
+    let bg = $('#fk-modal-bg');
+    if (!bg) {
+      bg = document.createElement('div'); bg.id = 'fk-modal-bg';
+      bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:flex-start;justify-content:center;padding:60px 16px;overflow-y:auto;z-index:9999';
+      bg.onclick = e => { if (e.target.id === 'fk-modal-bg') closeSettings(); };
+      document.body.appendChild(bg);
+    }
+    const tier = aiTier();
+    const provider = STATE.config.api_provider || 'anthropic';
+    const providerCfg = T3_PROVIDERS[provider];
+    bg.innerHTML = `
+      <div style="background:#13121a;border:1px solid #c08a3a;border-radius:5px;max-width:600px;width:100%;padding:22px 24px;color:#ebe3d2;font-family:system-ui,-apple-system,sans-serif;font-size:13.5px;line-height:1.55">
+        <div style="margin-bottom:14px"><label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">Tier</label>
+          <select id="fk-tier" style="width:100%;padding:8px 11px;background:#1a1922;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13.5px;font-family:inherit">
+            <option value="T0"${tier==='T0'?' selected':''}>T0 · off (default · the seed works fully without AI)</option>
+            <option value="T2"${tier==='T2'?' selected':''}>T2 · WebLLM in-browser · sovereign · pick a model below</option>
+            <option value="T3"${tier==='T3'?' selected':''}>T3 · BYOK · Anthropic / OpenAI / Google · stored in your browser only</option>
+          </select>
+        </div>
+        <div id="fk-t2-block" style="display:${tier==='T2'?'block':'none'};margin-bottom:14px;padding:12px 14px;background:#1a1922;border:1px solid #2a2934;border-radius:4px">
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">WebLLM model · 1B → 70B cascade</label>
+          <select id="fk-model" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:inherit">
+            ${Object.entries(WEBLLM_MODELS).map(([k,m]) => `<option value="${k}"${(STATE.config.webllm_model||DEFAULT_MODEL)===k?' selected':''}>${esc(m.label)} · ${esc(m.size)}</option>`).join('')}
+          </select>
+          <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <button id="fk-load-llm" style="padding:7px 14px;background:#c08a3a;color:#0a0a0a;border:none;border-radius:3px;font-weight:600;font-size:12px;cursor:pointer;font-family:inherit">${STATE.ai.ready?'✓ Loaded · switch':'Load model (one-time download)'}</button>
+            <span id="fk-llm-status" style="font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#a89e88;letter-spacing:.04em">${STATE.ai.ready?'ready':STATE.ai.loading?Math.round(STATE.ai.progress)+'%':'not loaded'}</span>
+          </div>
+          <div style="margin-top:8px;font-size:11px;color:#6e6a5e;line-height:1.55">First load downloads the model from @mlc-ai/web-llm CDN. Cached forever after. Inference is 100% local — open DevTools → Network during use, nothing leaves.</div>
+        </div>
+        <div id="fk-t3-block" style="display:${tier==='T3'?'block':'none'};margin-bottom:14px;padding:12px 14px;background:#1a1922;border:1px solid #2a2934;border-radius:4px">
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">BYOK provider</label>
+          <select id="fk-provider" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:inherit;margin-bottom:10px">
+            ${Object.entries(T3_PROVIDERS).map(([k,p]) => `<option value="${k}"${provider===k?' selected':''}>${esc(p.label)}</option>`).join('')}
+          </select>
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">Model</label>
+          <select id="fk-api-model" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:inherit;margin-bottom:10px">
+            ${providerCfg.models.map(m => `<option value="${m}"${(STATE.config.api_model||providerCfg.default)===m?' selected':''}>${esc(m)}</option>`).join('')}
+          </select>
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">API key</label>
+          <input type="password" id="fk-key" value="${esc(STATE.config.api_key || '')}" placeholder="${STATE.config.api_key ? '(set · leave empty to keep)' : 'sk-ant-... or sk-... or AIza...'}" autocomplete="off" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:ui-monospace,Menlo,monospace">
+          <div style="margin-top:8px;font-size:11px;color:#6e6a5e;line-height:1.55">Key lives in this browser only (localStorage). Sent direct to the provider — never to us. Wipe with Reset.</div>
+        </div>
+        <div style="margin-bottom:14px;padding:12px 14px;background:#1a1922;border:1px solid #2a2934;border-radius:4px">
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">Cross-seed mesh</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button id="fk-mesh-toggle" style="padding:6px 12px;background:${STATE.mesh.active?'#6b8d4a':'#1a1922'};color:${STATE.mesh.active?'#fff':'#a89e88'};border:1px solid ${STATE.mesh.active?'#6b8d4a':'#3a342c'};border-radius:3px;font-size:11px;cursor:pointer;font-family:inherit">${STATE.mesh.active?'✓ Active · disconnect':'Activate mesh'}</button>
+            <span style="font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#6e6a5e;letter-spacing:.04em">channel · <code style="background:#22212c;padding:1px 5px;border-radius:2px">${MESH_CHANNEL}</code></span>
+          </div>
+          <div style="margin-top:8px;font-size:11px;color:#6e6a5e;line-height:1.55">BroadcastChannel for same-device · WebRTC for cross-device (planned). Other estate seeds on the same channel discover each other automatically.</div>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+          <button onclick="FallKit.closeSettings()" style="padding:7px 14px;background:transparent;color:#a89e88;border:1px solid #3a342c;border-radius:3px;font-size:12px;cursor:pointer;font-family:inherit">Close</button>
+          <button id="fk-save" style="padding:7px 14px;background:#c08a3a;color:#0a0a0a;border:none;border-radius:3px;font-weight:600;font-size:12px;cursor:pointer;font-family:inherit">Save</button>
+        </div>
+      </div>`;
+    // Wire interactions
+    $('#fk-tier').onchange = () => {
+      const t = $('#fk-tier').value;
+      $('#fk-t2-block').style.display = t === 'T2' ? 'block' : 'none';
+      $('#fk-t3-block').style.display = t === 'T3' ? 'block' : 'none';
+    };
+    $('#fk-provider') && ($('#fk-provider').onchange = () => {
+      const p = $('#fk-provider').value;
+      const sel = $('#fk-api-model');
+      sel.innerHTML = T3_PROVIDERS[p].models.map(m => `<option value="${m}">${esc(m)}</option>`).join('');
+    });
+    $('#fk-load-llm') && ($('#fk-load-llm').onclick = () => {
+      const m = $('#fk-model').value;
+      loadWebLLM(m);
+    });
+    $('#fk-mesh-toggle').onclick = () => {
+      if (STATE.mesh.active) { STATE.mesh.bc?.close(); STATE.mesh.active = false; STATE.mesh.bc = null; notify('Mesh disconnected'); }
+      else meshStart({ seedName: STATE.config.seedName || 'seed' });
+      openSettings();  // refresh modal
+    };
+    $('#fk-save').onclick = () => {
+      STATE.config.ai_tier = $('#fk-tier').value;
+      if ($('#fk-model')) STATE.config.webllm_model = $('#fk-model').value;
+      if ($('#fk-provider')) STATE.config.api_provider = $('#fk-provider').value;
+      if ($('#fk-api-model')) STATE.config.api_model = $('#fk-api-model').value;
+      const newKey = $('#fk-key')?.value;
+      if (newKey) STATE.config.api_key = newKey;
+      saveConfig(); renderAiChip(); notify('Saved', 'ok'); closeSettings();
+    };
+  }
+  function closeSettings() { const bg = $('#fk-modal-bg'); if (bg) bg.remove(); }
+  // ─── Help section (returns HTML string for inclusion in seed Help tabs) ───
+  function helpSection() {
+    return `<div style="background:rgba(192,138,58,.05);border:1px solid #3a342c;border-radius:4px;padding:18px 22px;margin:14px 0">
+      <p style="font-size:13px;color:#a89e88;line-height:1.7;margin-bottom:10px">This seed runs fully without AI (<strong style="color:#c08a3a">T0</strong>, default). Enable a tier in settings if you want AI-assist features:</p>
+      <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+        <thead><tr><th style="padding:6px 10px;text-align:left;background:rgba(0,0,0,.2);font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#a89e88;letter-spacing:.08em;text-transform:uppercase">Tier</th><th style="padding:6px 10px;text-align:left;background:rgba(0,0,0,.2);font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#a89e88;letter-spacing:.08em;text-transform:uppercase">What it is</th></tr></thead>
+        <tbody>
+          <tr><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#c08a3a;font-weight:600">T0</td><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#a89e88">Off. The seed works fully. No AI · no downloads · no API calls.</td></tr>
+          <tr><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#c08a3a;font-weight:600">T2</td><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#a89e88">WebLLM in-browser. Pick a model: 1B (700MB, fast) → 3B (2GB, balanced) → 7B (5GB, capable) → 70B (40GB, frontier). One-time download, runs offline forever after. Zero data leaves your device.</td></tr>
+          <tr><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#c08a3a;font-weight:600">T3</td><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#a89e88">BYOK · Anthropic Claude · OpenAI GPT · Google Gemini. You bring the API key, you pay the provider direct. Key stays in your browser, sent direct to the provider, never proxied.</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:12px;color:#6e6a5e;line-height:1.6;margin-top:10px">Open the AI chip in the header to switch tier or check status. Cross-seed mesh activates a BroadcastChannel on <code style="background:#1a1922;padding:1px 5px;border-radius:2px">${MESH_CHANNEL}</code> so other estate seeds on the same device discover this one.</p>
+    </div>`;
+  }
+  // ─── CSS for AI chip ─────────────────────────────────────────────
+  function injectCss() {
+    const s = document.createElement('style');
+    s.id = 'fk-css';
+    s.textContent = `
+      #fk-ai-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 9px; border-radius:3px; font-family:ui-monospace,Menlo,monospace; font-size:10px; letter-spacing:.08em; text-transform:uppercase; font-weight:600; cursor:pointer; border:1px solid #3a342c; background:#1a1922; color:#a89e88; user-select:none; vertical-align:middle }
+      #fk-ai-chip:hover { border-color:#c08a3a; color:#ebe3d2 }
+      #fk-ai-chip.fk-chip-live { border-color:#6b8d4a; color:#6b8d4a; background:rgba(107,141,74,.10) }
+      #fk-ai-chip.fk-chip-loading { border-color:#e8a83a; color:#e8a83a; background:rgba(232,168,58,.10) }
+      #fk-ai-chip.fk-chip-warn { border-color:#a14a2a; color:#a14a2a; background:rgba(161,74,42,.08) }
+      #fk-ai-chip .fk-dot { width:6px; height:6px; border-radius:50%; background:currentColor; flex-shrink:0 }
+      #fk-ai-chip.fk-chip-loading .fk-dot { animation:fk-pulse 1s infinite }
+      @keyframes fk-pulse { 0%,100%{opacity:1}50%{opacity:.3} }
+      .fk-ai-assist { display:inline-flex; align-items:center; gap:5px; padding:4px 9px; font-size:11px; border:1px solid #c08a3a; color:#c08a3a; background:transparent; border-radius:3px; cursor:pointer; font-family:inherit }
+      .fk-ai-assist:hover { background:#c08a3a; color:#0a0a0a }
+      .fk-ai-assist::before { content:'✦'; font-size:12px }
+    `;
+    document.head.appendChild(s);
+  }
+  // ─── KCC Mint launcher (v1.2 · fork-this-seed shortcut) ──────────
+  function openMint() {
+    const slug = (STATE.config.seedName || location.hostname.split('.')[0] || 'seed').replace(/[^a-z0-9-]/gi, '-').toLowerCase();
+    const url = location.href.split('?')[0].split('#')[0];
+    const params = new URLSearchParams({ fork: '1', parent_slug: slug, parent_name: name, parent_url: url, parent_desc: desc });
+  }
+  // ─── Init ────────────────────────────────────────────────────────
+  function init(opts) {
+    opts = opts || {};
+    injectCss();
+    if (opts.seedName) STATE.config.seedName = opts.seedName;
+    if ($('#fk-ai-chip')) { renderAiChip(); return { version: FALL_KIT_VERSION, mounted: false }; }
+    const chip = document.createElement('button');
+    chip.id = 'fk-ai-chip';
+    chip.title = 'AI cascade · click to configure tier and model';
+    chip.innerHTML = '<span class="fk-dot"></span><span id="fk-ai-chip-text">T0 · off</span>';
+    chip.onclick = openSettings;
+    // Try anchor first, fall back to floating bottom-right
+    const anchor = opts.chipAnchor ? $(opts.chipAnchor) : null;
+    if (anchor) { anchor.appendChild(chip); }
+    else {
+      chip.style.cssText += ';position:fixed;bottom:14px;left:14px;z-index:9998;box-shadow:0 4px 14px rgba(0,0,0,.4)';
+      document.body.appendChild(chip);
+    }
+    // v1.2 · floating mint button next to chip
+    if (!$('#fk-mint-btn') && !opts.hideMint) {
+      const mintBtn = document.createElement('button');
+      mintBtn.id = 'fk-mint-btn';
+      mintBtn.title = 'Mint a fork of this seed as a KCC bundle · provenance economy';
+      mintBtn.innerHTML = '<span style="font-size:13px">✦</span> mint fork';
+      mintBtn.style.cssText = 'position:fixed;bottom:14px;left:130px;z-index:9998;display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border-radius:3px;font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;font-weight:600;cursor:pointer;border:1px solid #c08a3a;color:#c08a3a;background:rgba(10,10,15,.7);box-shadow:0 4px 14px rgba(0,0,0,.4)';
+      mintBtn.onmouseover = () => { mintBtn.style.background = '#c08a3a'; mintBtn.style.color = '#0a0a0a'; };
+      mintBtn.onmouseout  = () => { mintBtn.style.background = 'rgba(10,10,15,.7)'; mintBtn.style.color = '#c08a3a'; };
+      mintBtn.onclick = openMint;
+      document.body.appendChild(mintBtn);
+    }
+    renderAiChip();
+    return { version: FALL_KIT_VERSION, mounted: true };
+  }
+  // ─── Public API ──────────────────────────────────────────────────
+  root.FallKit = {
+    version: FALL_KIT_VERSION,
+    init: init,
+    aiTier: aiTier,
+    aiComplete: aiComplete,
+    loadWebLLM: loadWebLLM,
+    openSettings: openSettings,
+    closeSettings: closeSettings,
+    renderAiChip: renderAiChip,
+    helpSection: helpSection,
+    meshStart: meshStart,
+    meshPost: meshPost,
+    notify: notify,
+    openMint: openMint,  // v1.2 · launch kcc-mint with this seed prefilled as parent
+    MODELS: WEBLLM_MODELS,
+    PROVIDERS: T3_PROVIDERS,
+    state: STATE,
+  };
+})(typeof window !== 'undefined' ? window : globalThis);
+  // fall-kit init · auto-mounts a floating AI chip bottom-left
+  (function () {
+    function go() { if (typeof FallKit !== 'undefined') FallKit.init({ seedName: "fallmortgagepaper" }); }
+    else go();
+  })();
+'use strict';
+// ════════════════════════════════════════════════════════════════
+// FallMortgagePaper v1.0.0 · sovereign UK mortgage broker doc gen
+// prime 877 · MIT · v20.4 socket compliant · MCOB-shaped
+// Client data never leaves the device.
+// ════════════════════════════════════════════════════════════════
+const TOOLNAME='fallmortgagepaper';
+const VERSION='1.0.0';
+const PRIME=877;
+const STORE='fallmortgagepaper-v1';
+const SCHEMA_VERSION='1.0';
+const TABS=[
+ {id:'dashboard',name:'Dashboard',ico:'◐'},
+ {id:'cases', name:'Cases', ico:'⌂'},
+ {id:'generate', name:'Generate', ico:'△'},
+ {id:'library', name:'Library', ico:'▦'},
+ {id:'templates',name:'Templates',ico:'✆'},
+ {id:'firm', name:'Firm', ico:'¶'},
+ {id:'audit', name:'Audit', ico:'◯'},
+ {id:'help', name:'Q & A', ico:'?'},
+];
+let state={
+ active:'dashboard',
+ brandName:'FallMortgagePaper',
+ firm:null,
+ advisers:[],
+ clients:[],
+ cases:[],
+ documents:[],
+ templates:[],
+ audit:[],
+ ui:{
+ selectedClientId:null,
+ selectedCaseId:null,
+ selectedTemplateId:'idd',
+ selectedDocumentId:null,
+ activeAdviserId:null,
+ libFilterClient:'',
+ libFilterTpl:'',
+ libFilterStatus:'',
+ sectionOverrides:{},
+ extraContext:{},
+ chat:[],
+ },
+ settings:{
+ anthropicKey:'',
+ auditChain:true,
+ autoBroadcast:true,
+ },
+};
+const $=(s,p=document)=>p.querySelector(s);
+const $$=(s,p=document)=>Array.from(p.querySelectorAll(s));
+const uid=(p='id')=>p+'_'+Math.random().toString(36).slice(2,11);
+const now=()=>Date.now();
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=n=>(+n||0).toLocaleString('en-GB',{minimumFractionDigits:0,maximumFractionDigits:0});
+const money=n=>'£'+fmt(n);
+const moneyP=n=>'£'+(+n||0).toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:2});
+const dateStr=ts=>{if(!ts)return '—';const d=new Date(ts);return d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})};
+const dateTime=ts=>{if(!ts)return '—';const d=new Date(ts);return d.toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})};
+function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('show');clearTimeout(t._to);t._to=setTimeout(()=>t.classList.remove('show'),1900)}
+async function sha256(s){const buf=new TextEncoder().encode(s);const h=await crypto.subtle.digest('SHA-256',buf);return Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,'0')).join('')}
+// ════════════════════════════════════════════════════════════════
+// IDB · stores: firms, advisers, clients, cases, documents, templates, audit, state
+// ════════════════════════════════════════════════════════════════
+let db;
+function openDB(){return new Promise((res,rej)=>{const r=indexedDB.open(STORE,1);r.onupgradeneeded=e=>{const d=e.target.result;['firms','advisers','clients','cases','documents','templates','audit','state'].forEach(s=>{if(!d.objectStoreNames.contains(s))d.createObjectStore(s,{keyPath:s==='state'?undefined:'id'})})};r.onsuccess=e=>{db=e.target.result;res(db)};r.onerror=rej})}
+function idbGetAll(s){return new Promise(res=>{const tx=db.transaction(s,'readonly');const q=tx.objectStore(s).getAll();q.onsuccess=()=>res(q.result||[]);q.onerror=()=>res([])})}
+function idbGet(s,k){return new Promise(res=>{const tx=db.transaction(s,'readonly');const q=tx.objectStore(s).get(k);q.onsuccess=()=>res(q.result);q.onerror=()=>res(null)})}
+function idbPut(s,v,k){return new Promise(res=>{const tx=db.transaction(s,'readwrite');const o=tx.objectStore(s);const q=k!=null?o.put(v,k):o.put(v);q.onsuccess=()=>res(true);q.onerror=()=>res(false)})}
+function idbDel(s,k){return new Promise(res=>{const tx=db.transaction(s,'readwrite');tx.objectStore(s).delete(k);tx.oncomplete=()=>res(true)})}
+async function loadAll(){
+ if(!db)await openDB();
+ const [firms,advisers,clients,cases,documents,templates,audit,uiState]=await Promise.all([
+ idbGetAll('firms'),idbGetAll('advisers'),idbGetAll('clients'),idbGetAll('cases'),
+ idbGetAll('documents'),idbGetAll('templates'),idbGetAll('audit'),idbGet('state','ui')
+ ]);
+ state.firm=firms[0]||null;
+ state.advisers=advisers;
+ state.clients=clients;
+ state.cases=cases;
+ state.documents=documents;
+ state.audit=audit.sort((a,b)=>a.i-b.i);
+ state.templates=mergeTemplates(templates);
+ if(uiState){
+ state.ui=Object.assign({},state.ui,uiState.value||{});
+ state.brandName=uiState.brand||'FallMortgagePaper';
+ state.settings=Object.assign({},state.settings,uiState.settings||{});
+ }
+}
+async function persistUI(){if(!db)await openDB();await idbPut('state',{value:state.ui,brand:state.brandName,settings:state.settings},'ui')}
+// ════════════════════════════════════════════════════════════════
+// AUDIT chain · P3
+// ════════════════════════════════════════════════════════════════
+async function audit(action,opts={}){
+ if(!state.settings.auditChain)return;
+ if(!db)await openDB();
+ const prev=state.audit.length?state.audit[state.audit.length-1]:null;
+ const prevHash=prev?prev.docHash:'';
+ const i=(prev?prev.i:0)+1;
+ const payload=opts.payload||{};
+ const entry={id:uid('au'),i,ts:now(),tool:TOOLNAME,adviserId:opts.adviserId||state.ui.activeAdviserId||'',clientId:opts.clientId||'',action,reasoning:opts.reasoning||'',configVersion:TOOLNAME+'@'+VERSION,prevHash,docHash:'',payload};
+ entry.docHash=await sha256(JSON.stringify({i,ts:entry.ts,action,clientId:entry.clientId,prevHash,payload}));
+ state.audit.push(entry);
+ await idbPut('audit',entry);
+}
+// ════════════════════════════════════════════════════════════════
+// BUNDLE MESH · fall-client + fall-signal + fall-mortgage
+// ════════════════════════════════════════════════════════════════
+let bcClient,bcSignal,bcMortgage;
+let bcDebounce={};
+function broadcast(ch,type,payload){if(!state.settings.autoBroadcast||!ch)return;try{ch.postMessage({v:1,type,ts:now(),source:TOOLNAME,payload})}catch(e){}}
+function debouncedBroadcast(key,ch,type,payload){clearTimeout(bcDebounce[key]);bcDebounce[key]=setTimeout(()=>broadcast(ch,type,payload),300)}
+async function initMesh(){
+ try{bcSignal=new BroadcastChannel('fall-signal');bcSignal.postMessage({source:TOOLNAME,type:'hello',prime:PRIME,version:VERSION,ts:now()});bcSignal.addEventListener('message',e=>{const m=e.data;if(!m)return;if(m.type==='ping')bcSignal.postMessage({source:TOOLNAME,type:'pong',prime:PRIME})})}catch(e){}
+ try{bcClient=new BroadcastChannel('fall-client');bcClient.addEventListener('message',handleClientMessage);bcClient.postMessage({v:1,type:'sync.request',ts:now(),source:TOOLNAME,payload:{wants:['clients','advisers','firm']}})}catch(e){}
+ try{bcMortgage=new BroadcastChannel('fall-mortgage');bcMortgage.addEventListener('message',handleMortgageMessage);bcMortgage.postMessage({v:1,type:'sync.request',ts:now(),source:TOOLNAME,payload:{wants:['cases']}})}catch(e){}
+}
+async function handleClientMessage(e){
+ const m=e.data;if(!m||m.source===TOOLNAME)return;let dirty=false;
+ if(m.type==='client.created'||m.type==='client.updated'){
+ const c=m.payload;if(c&&c.id){
+ const idx=state.clients.findIndex(x=>x.id===c.id);
+ const ex=idx>=0?state.clients[idx]:null;
+ if(!ex||(c.updatedAt||0)>=(ex.updatedAt||0)){if(idx>=0)state.clients[idx]=c;else state.clients.push(c);await idbPut('clients',c);dirty=true}
+ }
+ }else if(m.type==='adviser.created'||m.type==='adviser.updated'){
+ const a=m.payload;if(a&&a.id){const idx=state.advisers.findIndex(x=>x.id===a.id);if(idx>=0)state.advisers[idx]=a;else state.advisers.push(a);await idbPut('advisers',a);dirty=true}
+ }else if(m.type==='firm.updated'){
+ const f=m.payload;if(f){state.firm=f;await idbPut('firms',f);dirty=true}
+ }else if(m.type==='sync.request'){
+ bcClient.postMessage({v:1,type:'sync.snapshot',ts:now(),source:TOOLNAME,payload:{clients:state.clients,advisers:state.advisers,firm:state.firm}});
+ }else if(m.type==='sync.snapshot'){
+ const p=m.payload||{};
+ if(Array.isArray(p.clients))for(const c of p.clients){const idx=state.clients.findIndex(x=>x.id===c.id);const ex=idx>=0?state.clients[idx]:null;if(!ex||(c.updatedAt||0)>=(ex.updatedAt||0)){if(idx>=0)state.clients[idx]=c;else state.clients.push(c);await idbPut('clients',c);dirty=true}}
+ if(Array.isArray(p.advisers))for(const a of p.advisers){const idx=state.advisers.findIndex(x=>x.id===a.id);const ex=idx>=0?state.advisers[idx]:null;if(!ex||(a.updatedAt||0)>=(ex.updatedAt||0)){if(idx>=0)state.advisers[idx]=a;else state.advisers.push(a);await idbPut('advisers',a);dirty=true}}
+ if(p.firm&&(!state.firm||(p.firm.updatedAt||0)>(state.firm.updatedAt||0))){state.firm=p.firm;await idbPut('firms',p.firm);dirty=true}
+ }
+ if(dirty)render();
+}
+async function handleMortgageMessage(e){
+ const m=e.data;if(!m||m.source===TOOLNAME)return;let dirty=false;
+ if(m.type==='case.created'||m.type==='case.updated'||m.type==='case.offered'||m.type==='case.completed'){
+ const c=m.payload;if(c&&c.id){
+ const idx=state.cases.findIndex(x=>x.id===c.id);
+ const ex=idx>=0?state.cases[idx]:null;
+ if(!ex||(c.updatedAt||0)>=(ex.updatedAt||0)){if(idx>=0)state.cases[idx]=c;else state.cases.push(c);await idbPut('cases',c);dirty=true}
+ }
+ }else if(m.type==='sync.request'){
+ bcMortgage.postMessage({v:1,type:'sync.snapshot',ts:now(),source:TOOLNAME,payload:{cases:state.cases}});
+ }else if(m.type==='sync.snapshot'){
+ const p=m.payload||{};
+ if(Array.isArray(p.cases))for(const c of p.cases){const idx=state.cases.findIndex(x=>x.id===c.id);const ex=idx>=0?state.cases[idx]:null;if(!ex||(c.updatedAt||0)>=(ex.updatedAt||0)){if(idx>=0)state.cases[idx]=c;else state.cases.push(c);await idbPut('cases',c);dirty=true}}
+ }
+ if(dirty)render();
+}
+function handleWindowMessage(e){
+ const m=e.data;if(!m||typeof m!=='object')return;
+ if(m.type==='fallmortgage.case.response'&&m.case){
+ const c=m.case;const idx=state.cases.findIndex(x=>x.id===c.id);if(idx>=0)state.cases[idx]=c;else state.cases.push(c);
+ idbPut('cases',c);toast('case received from fallmortgage');render();
+ }
+}
+async function emitClientUpdate(c){if(!bcClient)return;debouncedBroadcast('cl-'+c.id,bcClient,'client.updated',c)}
+async function emitFirmUpdate(){if(!bcClient||!state.firm)return;debouncedBroadcast('firm',bcClient,'firm.updated',state.firm)}
+async function emitDocCreated(d){if(!bcMortgage)return;broadcast(bcMortgage,'document.created',d)}
+async function emitEsisIssued(d){if(!bcMortgage)return;broadcast(bcMortgage,'esis.issued',d)}
+// ════════════════════════════════════════════════════════════════
+// TEMPLATE CATALOGUE · MCOB-shaped · 15 templates
+// {{path.to.value}} interpolation; [SIGNATURE_BLOCK] = token
+// ════════════════════════════════════════════════════════════════
+const TEMPLATES_BUILTIN=[];
+TEMPLATES_BUILTIN.push({
+ id:'idd', name:'Initial Disclosure Document (IDD)', version:'1.0',
+ mcob:'MCOB 4.4A · 4.5 · 4.6', kind:'disclosure',
+ description:'Standard pre-sale firm disclosure: scope of service, fee basis, regulatory status, complaints route.',
+ sections:[
+{id:'header', heading:'Initial Disclosure Document',
+ body:'**{{firm.name}}**\nFCA Reference: {{firm.fcaRefNo}}\nRegistered office: {{firm.registeredAddress.line1}}, {{firm.registeredAddress.city}}, {{firm.registeredAddress.postcode}}\n\nDate issued: {{today}}\nIssued to: **{{client.title}} {{client.firstName}} {{client.lastName}}**',
+ requiredFields:['firm.name','firm.fcaRefNo','client.firstName','client.lastName']},
+{id:'about-us', heading:'1. About our firm', locked:true,
+ body:'{{firm.name}} is authorised and regulated by the Financial Conduct Authority. Our FCA registration number is **{{firm.fcaRefNo}}**. You can verify our authorisation on the FCA Register at https://register.fca.org.uk.\n\n{{firm.networkStatement}}\n\nWe arrange and advise on regulated mortgage contracts as defined by the Financial Services and Markets Act 2000 (Regulated Activities) Order 2001.'},
+{id:'scope', heading:'2. Scope of our service',
+ body:'**Scope:** {{adviser.scopeStatement}}\n\nWe will recommend a mortgage which we consider, on a personal recommendation basis, to be suitable for your needs and circumstances having assessed your demands and needs in accordance with MCOB 4.7A.\n\nWe do **not** offer advice on or arrange equity release products, second-charge regulated mortgage contracts, commercial mortgages, or buy-to-let contracts that are unregulated, unless explicitly stated above.'},
+{id:'fee-basis', heading:'3. What you will pay us', locked:true,
+ body:'**Broker fee:** {{fees.brokerStatement}}\n**Payable:** {{fees.brokerWhen}}\n**Refund policy:** {{fees.refundPolicy}}\n\nWe will also typically receive a procuration fee from the lender on completion. The current range across the lenders on our panel is **0.30% to 0.55% of the loan amount**. The exact amount payable to us on your case will be confirmed in your suitability report and is in addition to any fee charged to you. Receipt of a procuration fee does not influence our recommendation — we are obliged by MCOB 4.7A.6 to recommend the most suitable product available to us irrespective of commission.'},
+{id:'no-obligation', heading:'4. You are under no obligation',
+ body:'You are under no obligation to accept any recommendation we make. If you proceed with an application based on our advice, you may withdraw at any point up to legal exchange (purchase) or completion (remortgage) without further fee, save for any fee already incurred per section 3 above.'},
+{id:'conflicts', heading:'5. Conflicts of interest',
+ body:'We are required by SYSC 10 to identify and manage conflicts of interest. We do not have material conflicts in respect of the lenders on our panel beyond the procuration fee disclosed above. Should a specific conflict arise in your case, it will be disclosed to you in writing before any recommendation.'},
+{id:'complaints', heading:'6. Complaints', locked:true,
+ body:'If you wish to complain about any aspect of our service please write to the Complaints Officer at {{firm.name}}, {{firm.registeredAddress.line1}}, {{firm.registeredAddress.postcode}}, or email {{firm.complaintsEmail}}.\n\nWe will acknowledge your complaint in writing within **3 business days** (DISP 1.6.1R) and issue a final response within **8 weeks** (DISP 1.6.2R). If you are not satisfied with our final response, or we have not issued one within 8 weeks, you may refer the complaint to the **Financial Ombudsman Service** (Exchange Tower, London E14 9SR · 0800 023 4567 · www.financial-ombudsman.org.uk). The FOS is a free, impartial service.\n\nThe FOS award limit for complaints about acts/omissions on or after 1 April 2024 is **£430,000**.'},
+{id:'compensation', heading:'7. Compensation', locked:true,
+ body:'We are covered by the **Financial Services Compensation Scheme** (FSCS). For advice on regulated mortgage contracts, compensation of up to **£85,000** per eligible claimant is available where we are unable to meet our obligations. Further information is at www.fscs.org.uk.'},
+{id:'data', heading:'8. Data protection',
+ body:'We process your personal data as a Data Controller under the UK GDPR and the Data Protection Act 2018, for the purposes of providing the advisory and arranging services described, complying with our regulatory obligations, and the prevention of money laundering. Records are retained for a minimum of **7 years** following the end of our engagement, in line with FCA SYSC and the FOS time-bar.'},
+{id:'ack', heading:'9. Client acknowledgement',
+ body:'I confirm I have received and read this Initial Disclosure Document before any advisory or arranging service is provided.\n\n[SIGNATURE_BLOCK]'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'fee-agreement', name:'Fee Agreement / Engagement Letter', version:'1.0',
+ mcob:'MCOB 4.4A.4R · 12.5', kind:'agreement',
+ description:'Broker fee structure, trigger point, refund policy. Signed before chargeable work commences.',
+ sections:[
+{id:'header', heading:'Mortgage Broker Fee Agreement',
+ body:'**{{firm.name}}** (FCA {{firm.fcaRefNo}})\nFor the attention of: **{{client.title}} {{client.firstName}} {{client.lastName}}**\nAddress: {{client.address.line1}}, {{client.address.city}}, {{client.address.postcode}}\n\nDate: {{today}}\nAdviser: {{adviser.name}} (CeMAP qualified, FCA SMF: {{adviser.smcrRole}})'},
+{id:'engagement', heading:'1. Engagement',
+ body:'This letter forms a binding agreement under which {{firm.name}} will provide regulated mortgage advice and arranging services to you in relation to a {{case.type}} on **{{case.property.address}}** (the "Case").'},
+{id:'fee', heading:'2. Our fee',
+ body:'**Fee structure:** {{fees.brokerStatement}}\n**Fee amount:** £{{fees.broker}}\n**Payable on:** {{fees.brokerWhen}}\n\nThe fee is for advising on and arranging a regulated mortgage contract and is in addition to any product, valuation, legal, or lender arrangement fees, which are itemised separately in the ESIS.'},
+{id:'commission', heading:'3. Lender procuration fee', locked:true,
+ body:'In addition to the fee above, we expect to receive a procuration fee from the recommending lender on completion, typically **0.30%–0.55%** of the loan amount. The exact figure will be disclosed in your suitability report. Receipt of this commission does not affect the impartiality of our recommendation (MCOB 4.7A.6R).'},
+{id:'refund', heading:'4. Refund policy',
+ body:'{{fees.refundPolicy}}\n\nIf no fee trigger is reached (per section 2) no fee is payable. If the application is declined by every lender we approach having undertaken reasonable due diligence on the merits of your case, no fee is payable. If you withdraw after the trigger point, the fee is payable in full save where withdrawal is caused by our breach.'},
+{id:'cooling-off', heading:'5. Cancellation', locked:true,
+ body:'You have **14 calendar days** from the date of this agreement to cancel without penalty, provided no advisory or arranging service has been delivered in that period at your express request. To cancel, write to the address above.'},
+{id:'sig', heading:'6. Acceptance',
+ body:'I accept the fee structure set out above and authorise {{firm.name}} to proceed with the Case on this basis.\n\n[SIGNATURE_BLOCK]'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'esis', name:'European Standardised Information Sheet (ESIS)', version:'1.0',
+ mcob:'MCOB 5A · Mortgage Credit Directive', kind:'illustration',
+ description:'Lender-specific pre-contract information per MCD 2016. Issued before binding offer.',
+ sections:[
+{id:'header', heading:'European Standardised Information Sheet',
+ body:'**This document was produced for {{client.title}} {{client.firstName}} {{client.lastName}} on {{today}}.**\n\nIt is produced on the basis of the information you have provided so far and on the current financial market conditions. The information below remains valid until **{{esis.validUntil}}** (excluding the interest rate and other costs). After that date, the lender may change it in line with market conditions.\n\nThis document does not constitute an obligation for {{case.product.lender}} to grant you a loan.'},
+{id:'lender', heading:'1. Lender', locked:true,
+ body:'**{{case.product.lender}}**\n\nWe are: **{{firm.name}}**, acting as a credit intermediary (mortgage broker), authorised and regulated by the FCA (registration {{firm.fcaRefNo}}). Our role: {{adviser.scopeShort}}.'},
+{id:'main-features', heading:'2. Main features of the loan',
+ body:'**Amount and currency of the loan to be granted:** £{{case.loan.amount}} (GBP).\n**Duration of the credit agreement:** {{case.loan.term}} years.\n**Type of loan:** {{case.loan.repayment}} ({{case.loan.repaymentDesc}}).\n**Type of interest rate:** {{case.product.type}} for {{case.product.period}} years, then reverting to the lender Standard Variable Rate (SVR).\n**Total amount to be reimbursed:** £{{esis.totalRepayable}}.\n**Maximum loan amount available relative to the value of the property:** {{case.loan.ltv}}% LTV.\n**Value of the property assumed to prepare this information sheet:** £{{case.property.value}}.'},
+{id:'rate', heading:'3. Interest rate and other costs',
+ body:'**The Annual Percentage Rate of Charge (APRC) is {{esis.aprc}}%.** The APRC is the total cost of the loan expressed as an annual percentage. It is provided to help you compare different offers.\n\nThe APRC applicable to your loan is {{esis.aprc}}%. It comprises:\n- **Initial interest rate:** {{case.product.rate}}% ({{case.product.type}}) for the first {{case.product.period}} years.\n- **Reversion rate:** {{esis.revertRate}}% (lender SVR at preparation date; SVR is variable and may change).\n- Costs included in the APRC: product fee £{{esis.productFee}}, valuation £{{esis.valuationFee}}, telegraphic transfer £{{esis.ttFee}}, our broker fee £{{fees.broker}}.\n- Costs **not** included: legal/conveyancing fees, stamp duty, buildings insurance, your independent survey if commissioned.\n\nPlease make sure that you are aware of all other taxes and costs associated with your loan.'},
+{id:'periodic', heading:'4. Frequency and number of payments',
+ body:'Repayment frequency: **Monthly**.\nNumber of payments: **{{esis.numPayments}}** ({{case.loan.term}} years × 12).'},
+{id:'amount-instalment', heading:'5. Amount of each instalment',
+ body:'**£{{case.loan.monthlyPayment}} per month** for the initial period of {{case.product.period}} years at {{case.product.rate}}% ({{case.product.type}}).\n\nThereafter, payments will revert to the lender SVR (currently {{esis.revertRate}}%) giving an indicative monthly payment of **£{{esis.revertMonthlyPayment}}**. The reversion payment is illustrative only — the SVR can change at any time at the lender\'s discretion.\n\nYour income may need to be in a currency other than the loan currency to repay the loan — not applicable in this case (loan and income both GBP).'},
+{id:'amortisation', heading:'6. Illustrative amortisation table',
+ body:'A full amortisation schedule is appended on request. Indicative balances:\n\n| Year | Balance start | Annual interest | Annual principal | Balance end |\n|---|---:|---:|---:|---:|\n| 1 | £{{esis.amort1.start}} | £{{esis.amort1.int}} | £{{esis.amort1.prin}} | £{{esis.amort1.end}} |\n| 5 | £{{esis.amort5.start}} | £{{esis.amort5.int}} | £{{esis.amort5.prin}} | £{{esis.amort5.end}} |\n| 10 | £{{esis.amort10.start}} | £{{esis.amort10.int}} | £{{esis.amort10.prin}} | £{{esis.amort10.end}} |\n| {{case.loan.term}} | £{{esis.amortEnd.start}} | £{{esis.amortEnd.int}} | £{{esis.amortEnd.prin}} | £0 |'},
+{id:'additional', heading:'7. Additional obligations',
+ body:'The borrower must comply with the following obligations in order to benefit from the lending conditions described in this document:\n\n- Maintain buildings insurance on the property for at least the reinstatement value.\n- Use the property as the principal residence of at least one borrower (residential cases) or rent only on assured shorthold tenancy (BTL cases).\n- Notify the lender within 14 days of any material change to your circumstances including income, employment, or marital status.\n\nNot complying with these obligations may have severe consequences (for example: forced sale of the property).'},
+{id:'erc', heading:'8. Early repayment', locked:true,
+ body:'You have the right to repay this loan early, in full or in part.\n\n**Early Repayment Charges (ERCs) apply during the initial product period as follows:**\n\n{{esis.ercSchedule}}\n\nWhere ERCs apply, they are calculated as a percentage of the amount repaid. After the end of the product period, no ERCs apply. Overpayments up to **10% of the outstanding balance per calendar year** are typically permitted without ERC — confirm with the offer document.'},
+{id:'flexible', heading:'9. Flexible features',
+ body:'**Overpayments:** Permitted up to 10% per year without ERC (subject to confirmation by lender offer).\n**Underpayments / payment holidays:** {{esis.paymentHolidayPolicy}}\n**Portability:** This product is **{{esis.portable}}** — meaning you {{esis.portableDesc}} take it with you if you move home, subject to a fresh affordability assessment and the property meeting lender criteria at that time.\n**Offset:** {{esis.offsetFeature}}'},
+{id:'rights', heading:'10. Borrower rights', locked:true,
+ body:'You have the right to receive a copy of the draft credit agreement free of charge. This provision does not apply where, at the time of the request, the lender is unwilling to proceed.\n\nFollowing receipt of the binding offer you have a **7-day reflection period** within which to consider the offer. You may accept the offer at any point during this period.'},
+{id:'complaints', heading:'11. Complaints', locked:true,
+ body:'**To the lender:** Complaints about this loan should be addressed to {{case.product.lender}} via their published complaints procedure. **To the broker:** Complaints about our advice or service should be addressed to {{firm.name}}.\n\nMaximum body of complaint handling: **8 weeks** (DISP 1.6.2R). Out-of-court complaint and redress mechanism: **Financial Ombudsman Service** — Exchange Tower, London E14 9SR · 0800 023 4567 · www.financial-ombudsman.org.uk.'},
+{id:'non-compliance', heading:'12. Non-compliance with loan commitments', locked:true,
+ body:'**Failure to keep up payments may result in serious consequences (for example: forced sale) and make obtaining credit more difficult.**\n\nIf you experience difficulty in making your monthly payments, please contact us straight away to discuss possible solutions. As a last resort, your home may be repossessed if you do not keep up payments. The lender may also apply default interest, may report your default to credit reference agencies, and may apply for a money judgment for any shortfall after sale.'},
+{id:'additional-info', heading:'13. Additional information',
+ body:'**Law applicable to credit agreement:** Laws of England and Wales (or Scotland / Northern Ireland depending on property location).\n**Supervisory authority:** Financial Conduct Authority, 12 Endeavour Square, London E20 1JN.\n\nThis ESIS was prepared by {{adviser.name}} on behalf of {{firm.name}} on {{today}}.'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'suitability', name:'Suitability Report (MCOB 4.7A)', version:'1.0',
+ mcob:'MCOB 4.7A · 4.7A.2R · 4.7A.6R', kind:'recommendation',
+ description:'Reasoned personal recommendation: client circumstances, objectives, recommended product, alternatives.',
+ sections:[
+{id:'header', heading:'Mortgage Suitability Report',
+ body:'**Prepared for:** {{client.title}} {{client.firstName}} {{client.lastName}}\n**Prepared by:** {{adviser.name}} on behalf of {{firm.name}}\n**Date:** {{today}}\n**Case reference:** {{case.ref}}\n**Subject property:** {{case.property.address}}, {{case.property.postcode}}'},
+{id:'introduction', heading:'1. Introduction',
+ body:'This Suitability Report sets out the personal mortgage recommendation we have made to you, our reasons for that recommendation, the costs, the risks, and the alternatives we considered. It is produced in compliance with MCOB 4.7A and should be read in full alongside the ESIS for the recommended product. Please raise any questions before submitting a full application.'},
+{id:'your-circumstances', heading:'2. Your circumstances',
+ body:'**Applicant 1:** {{client.title}} {{client.firstName}} {{client.lastName}}, age {{client.age}}, {{ctx.employmentStatus}}, basic salary £{{ctx.basicSalary}}, additional income £{{ctx.otherIncome}}.\n**Applicant 2:** {{ctx.applicant2}}\n\n**Dependants:** {{case.affordability.dependants}}\n**Combined gross monthly income:** £{{ctx.grossMonthlyIncome}}\n**Committed monthly expenditure:** £{{case.affordability.expenditure}}\n**Net disposable surplus:** £{{ctx.disposableMonthly}}\n**Credit profile:** {{client.creditHistoryNotes}}\n**Existing mortgages:** {{ctx.existingMortgagesSummary}}'},
+{id:'your-needs', heading:'3. Your demands and needs',
+ body:'Following our discussion, you have confirmed the following demands and needs for this transaction:\n\n- A {{case.type}} of approximately £{{case.loan.amount}} over a {{case.loan.term}}-year term on a **{{case.loan.repayment}}** basis.\n- Stability of monthly payment {{ctx.stabilityNeed}}.\n- {{ctx.flexibilityNeed}}\n- {{ctx.timelineNeed}}\n- {{ctx.otherPriorities}}\n\nThese demands and needs were assessed in line with MCOB 4.7A.2R.'},
+{id:'affordability', heading:'4. Affordability and stress testing', locked:true,
+ body:'**Loan-to-value (LTV):** {{case.loan.ltv}}%.\n**Income multiple applied:** {{ctx.incomeMultiple}}× combined gross.\n**Debt-to-income ratio:** {{case.affordability.dti}}%.\n**Stress test:** Affordability has been assessed at the lender pay-rate plus a margin in line with the lender\'s MCOB 11.6.18R stress test. The stress rate applied was **{{case.affordability.stressRate}}%** giving a stressed monthly payment of £{{ctx.stressedMonthly}}, which is **{{ctx.stressedPass}}** within your assessed disposable income.\n\nThis assessment is based solely on the information you have disclosed; it is your responsibility to inform us if your circumstances change before completion.'},
+{id:'recommendation', heading:'5. Our recommendation',
+ body:'We recommend the following product:\n\n| Item | Detail |\n|---|---|\n| **Lender** | {{case.product.lender}} |\n| **Product code** | {{case.loan.productCode}} |\n| **Loan amount** | £{{case.loan.amount}} |\n| **Term** | {{case.loan.term}} years |\n| **Repayment basis** | {{case.loan.repayment}} |\n| **Product type** | {{case.product.type}} for {{case.product.period}} years |\n| **Initial rate** | {{case.product.rate}}% |\n| **APRC** | {{esis.aprc}}% |\n| **Monthly payment (initial period)** | £{{case.loan.monthlyPayment}} |\n| **Reversion rate** | {{esis.revertRate}}% (lender SVR) |\n| **Product fee** | £{{esis.productFee}} ({{ctx.productFeeTreatment}}) |\n| **ERC profile** | {{esis.ercSummary}} |\n\nThe full lender pre-contract information is set out in the ESIS issued alongside this report.'},
+{id:'why-suitable', heading:'6. Why this product is suitable for you',
+ body:'{{recommendation.rationale}}\n\nIn particular:\n- **Payment certainty / flexibility match.** The {{case.product.type}} structure for {{case.product.period}} years matches your stated need for {{ctx.stabilityNeed}}.\n- **Affordability.** The initial monthly payment of £{{case.loan.monthlyPayment}} is well within your assessed disposable income and remains affordable on the lender stress test of {{case.affordability.stressRate}}%.\n- **Term.** A {{case.loan.term}}-year term aligns with your stated retirement plans and the maximum permitted by {{case.product.lender}} given the eldest applicant\'s age at term end ({{ctx.ageAtTermEnd}}).\n- **Lender appetite.** {{case.product.lender}} is comfortable with the credit profile, employment type, and LTV presented.'},
+{id:'alternatives', heading:'7. Alternatives considered',
+ body:'{{recommendation.alternativesConsidered}}\n\nWe selected the recommended product as it best balances cost, payment certainty, flexibility, and ERC exposure given the demands and needs recorded in section 3. Sources considered: {{adviser.scopeShort}}.'},
+{id:'risks', heading:'8. Risks', locked:true,
+ body:'You should consider the following risks before proceeding:\n\n- **Your home may be repossessed if you do not keep up repayments on your mortgage.**\n- After the initial {{case.product.period}}-year product period ends, your payments will revert to the lender SVR (currently {{esis.revertRate}}%, variable) which may be materially higher than the initial rate. We recommend reviewing your product **3-4 months before the end of the initial period**.\n- Early repayment during the initial period attracts an Early Repayment Charge (see ESIS section 8). If you intend to repay or move within {{case.product.period}} years and the product is not portable, an alternative product may be more appropriate.\n- Changes in your circumstances (income loss, divorce, illness) may make the payments unaffordable. Protection cover (life, CIC, income protection) is addressed in the separate Protection Recommendation document.\n- Future interest-rate rises may make the reversion payment substantially higher.\n- Property valuation: the lender is relying on its appointed valuer. We recommend you commission an independent survey appropriate to the property age and construction.'},
+{id:'protection', heading:'9. Protection',
+ body:'We have identified the following protection considerations from your fact-find:\n\n{{ctx.protectionGaps}}\n\nWhere identified, a separate Protection Recommendation document has been issued or will be issued in parallel. We are required by FCA rules to ensure that you have considered, at minimum, life cover sufficient to clear the mortgage in the event of death of a borrower (MCOB 4.7A allied). You are under no obligation to act on protection recommendations.'},
+{id:'proc-fee', heading:'10. Procuration fee disclosure', locked:true,
+ body:'On completion of this mortgage we expect to receive a procuration fee from {{case.product.lender}} of approximately **£{{case.procurationFee}}** (~{{ctx.procFeePct}}% of the loan amount). This commission is payable by the lender, not by you, and does not increase your costs. Receipt of this commission has not influenced our recommendation (MCOB 4.7A.6R). The recommendation is the most suitable option from the products available to us.'},
+{id:'next-steps', heading:'11. Next steps',
+ body:'If you wish to proceed with this recommendation, please:\n1. Sign and return the acceptance block below.\n2. Provide the supporting documents listed in the email accompanying this report (proof of identity, address, income, three months bank statements, latest mortgage statement if remortgaging).\n3. Pay the broker fee per the Fee Agreement, where due at application.\n\nOnce instructed we will submit the application to {{case.product.lender}} and keep you informed at each stage to offer.'},
+{id:'declaration', heading:'12. Declarations', locked:true,
+ body:'**Adviser declaration:** I confirm that the recommendation set out in this report is based on the information disclosed by the client and is, in my opinion, suitable in accordance with MCOB 4.7A. I have considered the products available to me per the scope statement above and disclosed the procuration fee receivable.\n\n**Client declaration:** I confirm that I have read this Suitability Report and the accompanying ESIS, that the information on which the recommendation is based remains correct, and that I wish to proceed with the recommended product.\n\n[SIGNATURE_BLOCK]'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'dip-letter', name:'Decision-in-Principle Confirmation Letter', version:'1.0',
+ mcob:'MCOB 11.6 informal', kind:'letter',
+ description:'Confirms DIP obtained, validity period, next steps to full application.',
+ sections:[
+{id:'header', heading:'Decision in Principle — Confirmation',
+ body:'**{{firm.name}}** · FCA {{firm.fcaRefNo}}\nFor: **{{client.title}} {{client.firstName}} {{client.lastName}}**\nDate: {{today}}\nCase: {{case.ref}}'},
+{id:'good-news', heading:'1. Good news',
+ body:'I am pleased to confirm that **{{case.product.lender}}** has issued a Decision in Principle (DIP) for your proposed mortgage, on the following indicative terms:\n\n| Item | Indicative term |\n|---|---|\n| Loan amount | £{{case.loan.amount}} |\n| Term | {{case.loan.term}} years |\n| Type | {{case.loan.repayment}} |\n| Product (proposed) | {{case.product.type}} {{case.product.period}}-yr @ {{case.product.rate}}% |\n| LTV | {{case.loan.ltv}}% |\n| DIP reference | {{ctx.dipRef}} |\n| DIP valid until | {{ctx.dipValidUntil}} |'},
+{id:'what-it-means', heading:'2. What a DIP is — and is not',
+ body:'A DIP is an indicative confirmation that, on the basis of a soft credit check and the information you have disclosed, the lender is willing in principle to advance the loan. It is **not** a binding offer. Final approval is subject to:\n\n- A full underwriting check on hard credit search.\n- Verification of identity, address, income, and expenditure documents.\n- Satisfactory valuation of the subject property.\n- Receipt and review of the full application pack.\n\nThe DIP credit search may register a soft footprint with credit reference agencies; in some cases a hard footprint is required at this stage — {{case.product.lender}}\'s policy on this case: **{{ctx.dipFootprint}}**.'},
+{id:'next-steps', heading:'3. Next steps to full application',
+ body:'1. Provide outstanding documents per the checklist circulated separately.\n2. Confirm your conveyancer\'s details (firm, contact, SRA number).\n3. Make payment of valuation fee £{{esis.valuationFee}} where due at application.\n4. We will then submit the full application; typical time to offer is **2–4 weeks** subject to lender service levels.'},
+{id:'reservation', heading:'4. Product reservation', locked:true,
+ body:'The product rate confirmed above is **not reserved by the DIP**. If lender rates change between today and full application submission, the rate available may be higher or lower. We will alert you to any material rate change before formal submission.'},
+{id:'sig', heading:'5. Yours',
+ body:'Please confirm receipt and instruction to proceed with the full application by replying to this letter or signing below.\n\nKind regards,\n\n{{adviser.name}}\n{{adviser.email}} · {{adviser.phone}}\n\n[SIGNATURE_BLOCK]'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'completion', name:'Completion Confirmation Letter', version:'1.0',
+ mcob:'MCOB post-completion', kind:'letter',
+ description:'Confirms mortgage completion, key dates, first payment, retention obligations.',
+ sections:[
+{id:'header', heading:'Mortgage Completion — Confirmation',
+ body:'**{{firm.name}}** · FCA {{firm.fcaRefNo}}\nFor: **{{client.title}} {{client.firstName}} {{client.lastName}}**\nDate: {{today}}\nCase: {{case.ref}}'},
+{id:'confirmed', heading:'1. Completion confirmed',
+ body:'I am pleased to confirm that your {{case.type}} has now completed on the terms set out in our Suitability Report and the ESIS.\n\n| Item | Detail |\n|---|---|\n| Lender | {{case.product.lender}} |\n| Loan amount | £{{case.loan.amount}} |\n| Product | {{case.product.type}} {{case.product.period}}-yr @ {{case.product.rate}}% |\n| Term | {{case.loan.term}} years |\n| Monthly payment | £{{case.loan.monthlyPayment}} |\n| First payment date | {{ctx.firstPaymentDate}} |\n| Property | {{case.property.address}} |'},
+{id:'keydates', heading:'2. Key dates to note',
+ body:'- **Initial product period ends:** {{ctx.productEndDate}} — contact us 3–4 months before this date to review your options.\n- **Direct debit:** Ensure your DD is active with the lender before the first payment date.\n- **Buildings insurance:** Maintain adequate buildings cover throughout the term — your lender requires this as a condition of the mortgage.'},
+{id:'retention', heading:'3. Document retention', locked:true,
+ body:'Please retain the following documents for the duration of your mortgage:\n- Mortgage offer letter\n- ESIS\n- Suitability Report\n- Property deeds (held by lender or solicitor)\n- Buildings insurance schedule\n\nWe will retain our file for a minimum of **7 years** from completion in line with FCA SYSC and Limitation Act 1980 requirements.'},
+{id:'sig', heading:'4. Yours',
+ body:'Congratulations on your {{case.type}}. Please do not hesitate to contact us if you have any questions.\n\n{{adviser.name}}\n{{adviser.email}} · {{adviser.phone}}'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'product-switch', name:'Product Transfer / Switch Letter', version:'1.0',
+ mcob:'MCOB 4.7A.21R product transfer', kind:'recommendation',
+ description:'Recommendation letter for product switch with existing lender at end of initial period.',
+ sections:[
+{id:'header', heading:'Product Transfer Recommendation',
+ body:'**{{firm.name}}** · FCA {{firm.fcaRefNo}}\nFor: **{{client.title}} {{client.firstName}} {{client.lastName}}**\nDate: {{today}}\nExisting lender: {{case.product.lender}}\nCurrent product expires: {{ctx.productEndDate}}'},
+{id:'context', heading:'1. Background',
+ body:'Your current mortgage product ({{case.product.type}} @ {{case.product.rate}}%) is approaching the end of its initial period. Without action, your rate will revert to the lender\'s Standard Variable Rate (currently {{ctx.revertRate}}%), which would increase your monthly payment to approximately £{{ctx.revertPayment}}.'},
+{id:'options', heading:'2. Options assessed',
+ body:'We have assessed the following options:\n\n**A. Product transfer with {{case.product.lender}}** (stay with current lender, new rate, no valuation/legal fees).\n**B. Remortgage to a new lender** (potentially better rate, but involves valuation, legal costs, and new application).\n**C. Revert to SVR** (no action, highest cost, full flexibility).\n\n{{recommendation.alternativesConsidered}}'},
+{id:'rec', heading:'3. Our recommendation',
+ body:'We recommend **Option {{ctx.recommendedOption}}** because:\n\n{{recommendation.rationale}}\n\nProposed product:\n- Rate: {{ctx.newRate}}%\n- Period: {{ctx.newPeriod}} years\n- Monthly payment: £{{ctx.newPayment}}\n- ERC: {{ctx.newErc}}\n- Fee: £{{ctx.newFee}}'},
+{id:'next', heading:'4. Next steps',
+ body:'If you wish to proceed, please confirm by signing below. We will submit the product transfer application to {{case.product.lender}}.\n\n[SIGNATURE_BLOCK]'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'redemption-request', name:'Redemption Statement Request', version:'1.0',
+ mcob:'informal · CML handbook', kind:'letter',
+ description:'Letter to existing lender requesting redemption statement for remortgage.',
+ sections:[
+{id:'header', heading:'Redemption Statement Request',
+ body:'**{{firm.name}}** · FCA {{firm.fcaRefNo}}\n\nTo: {{ctx.currentLender}} Redemptions Department\nDate: {{today}}\n\nRe: Account {{ctx.currentAccountNo}} — {{client.title}} {{client.firstName}} {{client.lastName}}'},
+{id:'request', heading:'Request',
+ body:'We act as mortgage broker for the above-named borrower(s) and are instructed to arrange a remortgage of the property at **{{case.property.address}}, {{case.property.postcode}}**.\n\nPlease provide a redemption statement valid for **30 days from today** showing:\n- Outstanding capital balance\n- Accrued interest to estimated redemption date\n- Any Early Repayment Charge applicable\n- Administration / deeds release fee\n- Total redemption figure\n\nPlease send the statement to us at {{firm.registeredAddress.line1}}, {{firm.registeredAddress.postcode}} or by email to {{adviser.email}}.'},
+{id:'authority', heading:'Authority',
+ body:'A signed Letter of Authority from the borrower(s) is enclosed / was previously submitted under reference {{ctx.loaRef}}.\n\n{{adviser.name}}, {{firm.name}}'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'complaint-ack', name:'Complaint Acknowledgement', version:'1.0',
+ mcob:'DISP 1.6.1R', kind:'letter',
+ description:'Written acknowledgement of complaint per DISP requirements.',
+ sections:[
+{id:'header', heading:'Complaint Acknowledgement',
+ body:'**{{firm.name}}** · FCA {{firm.fcaRefNo}}\nFor: **{{client.title}} {{client.firstName}} {{client.lastName}}**\nDate: {{today}}'},
+{id:'ack', heading:'',
+ body:'Dear {{client.title}} {{client.lastName}},\n\nThank you for your communication dated {{ctx.complaintDate}}. We are sorry to learn that you are dissatisfied with our service.\n\nWe understand your complaint to be:\n\n{{ctx.complaintSummary}}'},
+{id:'process', heading:'Our process', locked:true,
+ body:'In accordance with DISP 1.6, we will investigate your complaint thoroughly and impartially. We aim to resolve the matter within **8 weeks**. If we are unable to issue a final response within this period, we will write to explain why and advise you of your right to refer to the Financial Ombudsman Service.\n\nFinancial Ombudsman Service · Exchange Tower · London E14 9SR · 0800 023 4567 · www.financial-ombudsman.org.uk'},
+{id:'contact', heading:'Contact',
+ body:'Your complaint is being handled by {{ctx.complaintsHandler}}. If you have additional information, please send it to {{firm.complaintsEmail}}.\n\nYours sincerely,\n{{adviser.name}}'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'final-response', name:'Final Response Letter', version:'1.0',
+ mcob:'DISP 1.6.2R', kind:'letter',
+ description:'Final response to complaint with investigation outcome and FOS referral rights.',
+ sections:[
+{id:'header', heading:'Final Response',
+ body:'**{{firm.name}}** · FCA {{firm.fcaRefNo}}\nFor: **{{client.title}} {{client.firstName}} {{client.lastName}}**\nDate: {{today}}\n\nDear {{client.title}} {{client.lastName}},\n\nFurther to your complaint dated {{ctx.complaintDate}} and our acknowledgement, we have now completed our investigation.'},
+{id:'finding', heading:'Our finding',
+ body:'{{ctx.investigationSummary}}\n\n**Decision:** {{ctx.decision}}'},
+{id:'remedy', heading:'Remedy',
+ body:'{{ctx.remedy}}'},
+{id:'fos', heading:'Your rights', locked:true,
+ body:'If you are not satisfied with this response, you have the right to refer your complaint to the Financial Ombudsman Service within **6 months** of the date of this letter.\n\nFinancial Ombudsman Service\nExchange Tower, London E14 9SR\n0800 023 4567 · complaint.info@financial-ombudsman.org.uk\nwww.financial-ombudsman.org.uk\n\nReferring to the FOS does not affect your legal rights.\n\nYours sincerely,\n{{adviser.name}}\n{{firm.name}}'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'privacy', name:'Client Privacy Notice', version:'1.0',
+ mcob:'UK GDPR Art 13/14 · DPA 2018', kind:'disclosure',
+ description:'GDPR-compliant privacy notice for mortgage advisory clients.',
+ sections:[
+{id:'header', heading:'Client Privacy Notice',
+ body:'**{{firm.name}}** · FCA {{firm.fcaRefNo}}\nData Controller · ICO Registration: {{ctx.icoRegNo}}\nDate: {{today}}'},
+{id:'what', heading:'1. What data we collect',
+ body:'In providing mortgage advice and arranging services, we collect and process:\n- Identity data (name, DOB, nationality, ID documents)\n- Contact data (address, email, phone)\n- Financial data (income, expenditure, debts, credit history, bank statements)\n- Employment data (employer, tenure, salary, self-employment accounts)\n- Property data (address, value, tenure, condition)\n- Special category data where relevant (health conditions affecting insurance)'},
+{id:'basis', heading:'2. Legal basis', locked:true,
+ body:'We process your data under the following lawful bases:\n- **Contract** (Art 6(1)(b)) — to provide the advisory and arranging service you have engaged us for.\n- **Legal obligation** (Art 6(1)(c)) — to comply with FCA requirements (MCOB, SYSC, SUP), Money Laundering Regulations 2017, and HMRC requirements.\n- **Legitimate interest** (Art 6(1)(f)) — to manage our business, improve services, and pursue or defend legal claims.\n- **Consent** (Art 6(1)(a)) — for marketing communications only, withdrawable at any time.'},
+{id:'sharing', heading:'3. Who we share data with',
+ body:'Your data may be shared with:\n- Mortgage lenders (application processing)\n- Credit reference agencies (credit searches, identity verification)\n- Sourcing systems (mortgage panel searches)\n- Insurers (if you take protection products)\n- Compliance networks and our network principal (if applicable)\n- Solicitors / conveyancers (on your instruction)\n- Regulatory bodies (FCA, FOS, ICO — on request)'},
+{id:'retention', heading:'4. How long we keep it', locked:true,
+ body:'We retain your data for a minimum of **7 years** after the end of our relationship, in line with:\n- FCA SYSC record-keeping requirements\n- Financial Ombudsman Service time-bar (6 years + extension)\n- Limitation Act 1980\n\nAfter this period, data is securely deleted unless a legal hold applies.'},
+{id:'rights', heading:'5. Your rights', locked:true,
+ body:'Under UK GDPR you have the right to:\n- Access your personal data (Subject Access Request)\n- Rectify inaccurate data\n- Erase data (where no legal obligation to retain)\n- Restrict or object to processing\n- Data portability\n- Withdraw consent\n- Lodge a complaint with the ICO (ico.org.uk · 0303 123 1113)\n\nTo exercise any right, contact {{firm.complaintsEmail}} or write to {{firm.registeredAddress.line1}}, {{firm.registeredAddress.postcode}}.'}
+]});
+TEMPLATES_BUILTIN.push({
+ id:'referral', name:'Referral / Introducer Letter', version:'1.0',
+ mcob:'MCOB 2.6A introducer', kind:'letter',
+ description:'Letter confirming referral source and any fee payable to introducer.',
+ sections:[
+{id:'header', heading:'Referral Acknowledgement',
+ body:'**{{firm.name}}** · FCA {{firm.fcaRefNo}}\nDate: {{today}}'},
+{id:'body', heading:'',
+ body:'To: {{ctx.introducerName}}\n\nThank you for referring **{{client.title}} {{client.firstName}} {{client.lastName}}** to us.\n\nReferral reference: {{ctx.referralRef}}\nDate of referral: {{ctx.referralDate}}\n\nWe confirm that:\n- A referral fee of **£{{ctx.referralFee}}** is payable to you on completion of the mortgage, per our introducer agreement dated {{ctx.introducerAgreementDate}}.\n- The referral fee will be disclosed to the client in the IDD and suitability report.\n- You have not provided regulated advice to the client and the referral is on an unadvised basis (MCOB 2.6A).\n\n{{adviser.name}}\n{{firm.name}}'}
+]});
+// ════════════════════════════════════════════════════════════════
+// TEMPLATE ENGINE
+// ════════════════════════════════════════════════════════════════
+function mergeTemplates(saved){
+ const map=new Map((saved||[]).map(t=>[t.id,t]));
+ return TEMPLATES_BUILTIN.map(def=>{
+ const s=map.get(def.id);
+ if(!s)return {...def};
+ return {...def,sections:def.sections.map(sec=>{
+ const over=s.sectionOverrides&&s.sectionOverrides[sec.id];
+ return over!=null?{...sec,body:over}:sec;
+ })};
+ });
+}
+function buildContext(clientId,caseId){
+ const f=state.firm||{};
+ const fa=f.registeredAddress||{};
+ const c=(clientId?state.clients.find(x=>x.id===clientId):null)||{};
+ const ca=(c.address||{});
+ const cs=(caseId?state.cases.find(x=>x.id===caseId):null)||{};
+ const pr=cs.product||{};
+ const ln=cs.loan||{};
+ const af=cs.affordability||{};
+ const fe=cs.fees||{};
+ const a=state.advisers.find(x=>x.id===(state.ui.activeAdviserId||''))||state.advisers[0]||{};
+ const d=new Date();
+ const ctx=state.ui.extraContext||{};
+ const flat={
+ 'firm.name':f.name||'[Firm Name]','firm.fcaRefNo':f.fcaRefNo||'[FCA Ref]',
+ 'firm.registeredAddress.line1':fa.line1||f.address||'[Address]',
+ 'firm.registeredAddress.city':fa.city||'[City]','firm.registeredAddress.postcode':fa.postcode||'[Postcode]',
+ 'firm.complaintsEmail':f.complaintsEmail||f.email||'[Email]',
+ 'firm.networkStatement':f.networkStatement||'We are directly authorised by the FCA.',
+ 'client.title':c.title||'','client.firstName':c.firstName||c.name||'[First Name]',
+ 'client.lastName':c.lastName||'[Last Name]',
+ 'client.address.line1':ca.line1||c.address||'[Address]','client.address.city':ca.city||'[City]',
+ 'client.address.postcode':ca.postcode||'[Postcode]',
+ 'client.age':c.age||'[Age]','client.creditHistoryNotes':c.creditHistoryNotes||'Clean — no adverse.',
+ 'case.ref':cs.ref||'[Case Ref]','case.type':cs.type||'purchase',
+ 'case.property.address':cs.property?.address||'[Property Address]',
+ 'case.property.postcode':cs.property?.postcode||'[Postcode]',
+ 'case.loan.amount':ln.amount||'[Amount]','case.loan.term':ln.term||'[Term]',
+ 'case.loan.repayment':ln.repayment||'capital & interest',
+ 'case.loan.ltv':ln.ltv||'[LTV]','case.loan.monthlyPayment':ln.monthlyPayment||'[Monthly]',
+ 'case.loan.productCode':ln.productCode||'[Product Code]',
+ 'case.product.lender':pr.lender||'[Lender]','case.product.type':pr.type||'fixed',
+ 'case.product.rate':pr.rate||'[Rate]','case.product.period':pr.period||'[Period]',
+ 'case.affordability.dependants':af.dependants||'0','case.affordability.expenditure':af.expenditure||'[Expenditure]',
+ 'case.affordability.dti':af.dti||'[DTI]','case.affordability.stressRate':af.stressRate||'[Stress Rate]',
+ 'case.procurationFee':cs.procurationFee||'[Proc Fee]',
+ 'fees.brokerStatement':fe.brokerStatement||'A fixed fee, payable on application.',
+ 'fees.broker':fe.broker||'[Fee]','fees.brokerWhen':fe.brokerWhen||'on full application submission',
+ 'fees.refundPolicy':fe.refundPolicy||'The fee is non-refundable once an application has been submitted.',
+ 'adviser.name':a.name||'[Adviser]','adviser.email':a.email||'[Email]',
+ 'adviser.phone':a.phone||'[Phone]','adviser.smcrRole':a.smcrRole||'CF1',
+ 'adviser.scopeStatement':a.scopeStatement||'We search the whole of market.',
+ 'adviser.scopeShort':a.scopeShort||'whole of market',
+ 'adviser.fcaRefNo':a.fcaRefNo||'[Adviser FCA Ref]',
+ 'esis.aprc':cs.esis?.aprc||'[APRC]','esis.revertRate':cs.esis?.revertRate||'[SVR]',
+ 'esis.productFee':cs.esis?.productFee||'0','esis.ercSummary':cs.esis?.ercSummary||'[ERC]',
+ 'esis.valuationFee':cs.esis?.valuationFee||'0',
+ 'recommendation.rationale':cs.recommendation?.rationale||'[Explain why this product is suitable]',
+ 'recommendation.alternativesConsidered':cs.recommendation?.alternativesConsidered||'[List alternatives considered and reasons for rejection]',
+ 'today':d.toLocaleDateString('en-GB',{day:'2-digit',month:'long',year:'numeric'}),
+ };
+ for(const[k,v] of Object.entries(ctx)){flat['ctx.'+k]=v;}
+ return flat;
+}
+function resolvePlaceholders(text,ctx){
+ return text.replace(/\{\{([^}]+)\}\}/g,(m,k)=>{
+ const key=k.trim();
+ return ctx[key]!=null?String(ctx[key]):m;
+ });
+}
+function renderPaperSection(sec,ctx,overrides){
+ const raw=overrides&&overrides[sec.id]!=null?overrides[sec.id]:sec.body;
+ const resolved=resolvePlaceholders(raw,ctx);
+ let html='';
+ const lines=resolved.split('\n');
+ let inTable=false,tableHTML='';
+ for(const line of lines){
+ const trimmed=line.trim();
+ if(trimmed.startsWith('|')&&trimmed.endsWith('|')){
+ if(!inTable){inTable=true;tableHTML='<table>';}
+ const cells=trimmed.slice(1,-1).split('|').map(c=>c.trim());
+ if(cells.every(c=>/^-+$/.test(c)))continue;
+ const isHeader=!tableHTML.includes('<td');
+ const tag=isHeader?'th':'td';
+ tableHTML+='<tr>'+cells.map(c=>`<${tag}>${esc(c)}</${tag}>`).join('')+'</tr>';
+ continue;
+ }
+ if(inTable){tableHTML+='</table>';html+=tableHTML;tableHTML='';inTable=false;}
+ if(!trimmed){html+='<br>';continue;}
+ if(trimmed.startsWith('**')&&trimmed.endsWith('**')){html+=`<h3>${esc(trimmed.slice(2,-2))}</h3>`;continue;}
+ if(trimmed.startsWith('---')){html+='<hr>';continue;}
+ if(trimmed==='[SIGNATURE_BLOCK]'){
+ html+=`<div class="sig-block"><div><div class="sig-line"></div><p>Client signature</p><p>Date: ________________</p></div><div><div class="sig-line"></div><p>Adviser signature</p><p>Date: ________________</p></div></div>`;
+ continue;
+ }
+ if(trimmed.startsWith('- ')){html+=`<p style="padding-left:18px">&#8226; ${formatInline(trimmed.slice(2))}</p>`;continue;}
+ if(/^\d+\.\s/.test(trimmed)){html+=`<p style="padding-left:18px">${formatInline(trimmed)}</p>`;continue;}
+ html+=`<p>${formatInline(trimmed)}</p>`;
+ }
+ if(inTable){tableHTML+='</table>';html+=tableHTML;}
+ if(sec.locked)html=`<div class="clause-locked">${html}</div>`;
+ return html;
+}
+function formatInline(s){
+ return esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\[([^\]]+)\]/g,'<span class="placeholder-empty">$1</span>');
+}
+function renderFullPaper(tplId,ctx,overrides){
+ const tpl=TEMPLATES_BUILTIN.find(t=>t.id===tplId);
+ if(!tpl)return '<p>Template not found.</p>';
+ let html='';
+ for(const sec of tpl.sections){
+ if(sec.heading)html+=`<h2>${esc(sec.heading)}</h2>`;
+ html+=renderPaperSection(sec,ctx,overrides);
+ }
+ html+=`<hr><p style="font-size:10px;text-align:center;color:#6a5a40;font-family:var(--mono)">Generated by FallMortgagePaper · prime 877 · sovereign · client data never leaves device</p>`;
+ return html;
+}
+// ════════════════════════════════════════════════════════════════
+// DOCUMENT CRUD
+// ════════════════════════════════════════════════════════════════
+function newDocumentRec(tplId,clientId,caseId){
+ return {
+ id:uid('doc'),firmId:state.firm?state.firm.id:'',
+ tplId,clientId:clientId||'',caseId:caseId||'',
+ status:'draft',title:'',sectionOverrides:{},
+ createdAt:now(),updatedAt:now(),issuedAt:null,
+ adviserId:state.ui.activeAdviserId||'',notes:'',hash:'',
+ };
+}
+async function saveDocumentRec(doc,action,reasoning){
+ doc.updatedAt=now();
+ const idx=state.documents.findIndex(d=>d.id===doc.id);
+ if(idx>=0)state.documents[idx]=doc;else state.documents.push(doc);
+ await idbPut('documents',doc);
+ await audit(action||'document.saved',{clientId:doc.clientId,reasoning:reasoning||'',payload:{docId:doc.id,tplId:doc.tplId,status:doc.status}});
+ emitDocCreated(doc);
+}
+async function deleteDocumentRec(docId){
+ state.documents=state.documents.filter(d=>d.id!==docId);
+ await idbDel('documents',docId);
+ await audit('document.deleted',{reasoning:'user deleted',payload:{docId}});
+}
+// ════════════════════════════════════════════════════════════════
+// RENDER
+// ════════════════════════════════════════════════════════════════
+function render(){
+ renderTabs();
+ const v=$('#view');
+ switch(state.active){
+ case 'dashboard':return renderDashboard(v);
+ case 'clients':return renderClients(v);
+ case 'cases':return renderCases(v);
+ case 'generate':return renderGenerate(v);
+ case 'library':return renderLibrary(v);
+ case 'templates':return renderTemplatesView(v);
+ case 'firm':return renderFirm(v);
+ case 'audit':return renderAudit(v);
+ case 'help':return renderHelp(v);
+ default:renderDashboard(v);
+ }
+}
+function renderTabs(){
+ $('#tabNav').innerHTML=TABS.map(t=>`<button class="${state.active===t.id?'active':''}" onclick="switchTab('${t.id}')">${t.ico} ${t.name}</button>`).join('');
+ $('#brandName').textContent=state.brandName;
+}
+function switchTab(id){state.active=id;persistUI();render();}
+// ════════════════════════
+// DASHBOARD
+// ════════════════════════
+function renderDashboard(v){
+ const docs=state.documents;
+ const drafts=docs.filter(d=>d.status==='draft').length;
+ const issued=docs.filter(d=>d.status==='issued').length;
+ const tplUsage={};docs.forEach(d=>{tplUsage[d.tplId]=(tplUsage[d.tplId]||0)+1;});
+ const topTpls=Object.entries(tplUsage).sort((a,b)=>b[1]-a[1]).slice(0,5);
+ const recent=docs.slice().sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0)).slice(0,8);
+ v.innerHTML=`
+ <div class="disclaimer"><strong>&#9670; Regulatory notice:</strong> FallMortgagePaper generates MCOB-shaped document templates pre-populated from your client and case data. Locked clauses contain regulatory text from MCOB, DISP, UK GDPR, and MCD that should not be altered. Editable sections are your responsibility. This tool does not constitute legal or financial advice. Your home may be repossessed if you do not keep up repayments on your mortgage.</div>
+ <div class="section-h"><h2>Dashboard</h2><div class="sub">fallmortgagepaper · prime 877</div></div>
+ <div class="grid" style="margin-bottom:18px">
+ <div class="card"><h3>Documents</h3>
+ <div class="kpi"><span class="l">Total</span><span class="v brass">${docs.length}</span></div>
+ <div class="kpi"><span class="l">Draft</span><span class="v">${drafts}</span></div>
+ <div class="kpi"><span class="l">Issued</span><span class="v amber">${issued}</span></div>
+ </div>
+ <div class="card"><h3>Data</h3>
+ <div class="kpi"><span class="l">Clients</span><span class="v">${state.clients.length}</span></div>
+ <div class="kpi"><span class="l">Cases</span><span class="v">${state.cases.length}</span></div>
+ <div class="kpi"><span class="l">Advisers</span><span class="v">${state.advisers.length}</span></div>
+ <div class="kpi"><span class="l">Firm</span><span class="v ${state.firm?'green':'red'}">${state.firm?'Set':'—'}</span></div>
+ </div>
+ <div class="card"><h3>Top Templates</h3>
+ ${topTpls.length?topTpls.map(([tid,ct])=>{const t=TEMPLATES_BUILTIN.find(x=>x.id===tid);return `<div class="kpi"><span class="l">${t?t.name.slice(0,28):tid}</span><span class="v">${ct}</span></div>`;}).join(''):'<div class="kpi"><span class="l">No documents yet</span><span class="v">—</span></div>'}
+ </div>
+ </div>
+ <div class="section-h"><h2>Recent Documents</h2></div>
+ ${recent.length?`<table><thead><tr><th>Title</th><th>Template</th><th>Client</th><th>Status</th><th>Updated</th></tr></thead><tbody>${
+ recent.map(d=>{const tpl=TEMPLATES_BUILTIN.find(t=>t.id===d.tplId);const cl=state.clients.find(c=>c.id===d.clientId);
+ return `<tr style="cursor:pointer" onclick="openDocument('${d.id}')"><td>${esc(d.title||tpl?.name||d.tplId)}</td><td><span class="tag">${esc(tpl?.kind||'')}</span></td><td>${esc(cl?.firstName||cl?.name||'')} ${esc(cl?.lastName||'')}</td><td><span class="pill ${d.status}">${d.status}</span></td><td>${dateTime(d.updatedAt)}</td></tr>`;}).join('')
+ }</tbody></table>`:'<div class="empty"><h3>No documents yet</h3><p>Go to Generate to create your first document.</p></div>'}`;
+}
+// ════════════════════════
+// CLIENTS
+// ════════════════════════
+function renderClients(v){
+ const cls=state.clients.filter(c=>!c.archivedAt);
+ v.innerHTML=`
+ <div class="section-h"><h2>Clients</h2><div class="sub">${cls.length} active</div></div>
+ <p style="font-size:12px;color:var(--cream-dim);margin-bottom:14px">Clients sync from <strong>fallmortgage</strong> / <strong>fallmortgageonboard</strong> via BroadcastChannel, or add here.</p>
+ <button class="btn primary" onclick="openModal('addclient')" style="margin-bottom:14px">+ Client</button>
+ ${cls.length?cls.map(c=>`
+ <div class="client-row ${state.ui.selectedClientId===c.id?'active':''}" onclick="selectClient('${c.id}')">
+ <div><div style="font-family:var(--serif);font-size:14px">${esc((c.title||'')+' '+(c.firstName||c.name||'')+' '+(c.lastName||''))}</div></div>
+ <div style="font-family:var(--mono);font-size:10px;color:var(--cream-dim)">${state.cases.filter(cs=>cs.clientId===c.id).length} cases</div>
+ </div>`).join(''):'<div class="empty"><h3>No clients</h3><p>Open fallmortgage in another tab to sync, or add one here.</p></div>'}`;
+}
+function selectClient(id){state.ui.selectedClientId=id;persistUI();render();}
+// ════════════════════════
+// CASES
+// ════════════════════════
+function renderCases(v){
+ const cs=state.cases;
+ v.innerHTML=`
+ <div class="section-h"><h2>Cases</h2><div class="sub">${cs.length} total</div></div>
+ <button class="btn primary" onclick="openModal('addcase')" style="margin-bottom:14px">+ Case</button>
+ ${cs.length?`<table><thead><tr><th>Ref</th><th>Client</th><th>Type</th><th>Lender</th><th>Loan</th><th>Status</th></tr></thead><tbody>${
+ cs.map(c=>{const cl=state.clients.find(x=>x.id===c.clientId);
+ return `<tr style="cursor:pointer" onclick="selectCase('${c.id}')"><td>${esc(c.ref||'—')}</td><td>${esc((cl?.firstName||cl?.name||''))} ${esc(cl?.lastName||'')}</td><td>${esc(c.type||'—')}</td><td>${esc(c.product?.lender||'—')}</td><td class="r">${c.loan?moneyP(c.loan.amount):'—'}</td><td><span class="tag ${c.status==='completed'?'green':c.status==='offered'?'amber':''}">${esc(c.status||'—')}</span></td></tr>`;}).join('')
+ }</tbody></table>`:'<div class="empty"><h3>No cases</h3><p>Cases sync from fallmortgage, or add one here for document generation.</p></div>'}`;
+}
+function selectCase(id){state.ui.selectedCaseId=id;state.active='generate';persistUI();render();}
+// ════════════════════════
+// GENERATE
+// ════════════════════════
+function renderGenerate(v){
+ const tpl=TEMPLATES_BUILTIN.find(t=>t.id===state.ui.selectedTemplateId)||TEMPLATES_BUILTIN[0];
+ const ctx=buildContext(state.ui.selectedClientId,state.ui.selectedCaseId);
+ const overrides=state.ui.sectionOverrides[tpl.id]||{};
+ v.innerHTML=`
+ <div class="section-h"><h2>Generate Document</h2><div class="actions">
+ <button class="btn primary" onclick="saveCurrentDoc()">Save Draft</button>
+ <button class="btn" onclick="issueCurrentDoc()">Issue</button>
+ <button class="btn ghost" onclick="printPaper()">Print / PDF</button>
+ <button class="btn ghost" onclick="copyPaperText()">Copy Text</button>
+ </div></div>
+ <div class="doc-stage">
+ <div class="doc-side">
+ <div class="card"><h3>Template</h3>
+ <select id="selTpl" onchange="changeTpl(this.value)" style="width:100%;margin-bottom:6px">
+ ${TEMPLATES_BUILTIN.map(t=>`<option value="${t.id}" ${t.id===tpl.id?'selected':''}>${esc(t.name)}</option>`).join('')}
+ </select>
+ <div style="font-size:10px;color:var(--cream-dim)">${esc(tpl.mcob||'')} · ${esc(tpl.kind||'')}</div>
+ </div>
+ <div class="card"><h3>Client</h3>
+ <select id="selClient" onchange="changeClient(this.value)" style="width:100%">
+ <option value="">— none —</option>
+ ${state.clients.filter(c=>!c.archivedAt).map(c=>`<option value="${c.id}" ${c.id===state.ui.selectedClientId?'selected':''}>${esc((c.title||'')+' '+(c.firstName||c.name||'')+' '+(c.lastName||''))}</option>`).join('')}
+ </select>
+ </div>
+ <div class="card"><h3>Case</h3>
+ <select id="selCase" onchange="changeCase(this.value)" style="width:100%">
+ <option value="">— none —</option>
+ ${state.cases.filter(c=>!state.ui.selectedClientId||c.clientId===state.ui.selectedClientId).map(c=>`<option value="${c.id}" ${c.id===state.ui.selectedCaseId?'selected':''}>${esc(c.ref||c.id)} — ${esc(c.type||'')}</option>`).join('')}
+ </select>
+ </div>
+ <div class="card"><h3>Extra Context</h3>
+ <div style="font-size:10px;color:var(--cream-dim);margin-bottom:6px">Key-value pairs for {{ctx.*}} placeholders</div>
+ <textarea id="extraCtx" rows="4" style="width:100%" oninput="updateExtraCtx(this.value)">${Object.entries(state.ui.extraContext||{}).map(([k,v])=>k+'='+v).join('\n')}</textarea>
+ </div>
+ <div class="card"><h3>Sections <span class="meta">${tpl.sections.length}</span></h3>
+ ${tpl.sections.map(sec=>`
+ <div class="section-edit ${sec.locked?'locked':''}">
+ <div class="hd"><span class="nm">${esc(sec.heading||sec.id)}</span><span class="tg">${sec.locked?'locked':'editable'}</span></div>
+ <textarea rows="3" data-sec="${sec.id}" ${sec.locked?'readonly':''} oninput="updateSectionOverride('${tpl.id}','${sec.id}',this.value)">${esc(overrides[sec.id]!=null?overrides[sec.id]:sec.body)}</textarea>
+ </div>`).join('')}
+ <button class="btn ghost sm" style="margin-top:8px" onclick="resetOverrides('${tpl.id}')">Reset all</button>
+ </div>
+ </div>
+ <div>
+ <div class="paper" id="paperPreview">${renderFullPaper(tpl.id,ctx,overrides)}</div>
+ </div>
+ </div>`;
+}
+function changeTpl(id){state.ui.selectedTemplateId=id;persistUI();render();}
+function changeClient(id){state.ui.selectedClientId=id||null;persistUI();render();}
+function changeCase(id){state.ui.selectedCaseId=id||null;persistUI();render();}
+function updateExtraCtx(val){
+ const o={};
+ val.split('\n').forEach(line=>{const eq=line.indexOf('=');if(eq>0)o[line.slice(0,eq).trim()]=line.slice(eq+1).trim();});
+ state.ui.extraContext=o;
+ clearTimeout(updateExtraCtx._t);
+ updateExtraCtx._t=setTimeout(()=>{persistUI();render();},600);
+}
+function updateSectionOverride(tplId,secId,val){
+ if(!state.ui.sectionOverrides[tplId])state.ui.sectionOverrides[tplId]={};
+ state.ui.sectionOverrides[tplId][secId]=val;
+ const tpl=TEMPLATES_BUILTIN.find(t=>t.id===tplId);
+ const ctx=buildContext(state.ui.selectedClientId,state.ui.selectedCaseId);
+ const pp=$('#paperPreview');
+ if(pp&&tpl)pp.innerHTML=renderFullPaper(tplId,ctx,state.ui.sectionOverrides[tplId]||{});
+ clearTimeout(updateSectionOverride._t);
+ updateSectionOverride._t=setTimeout(()=>persistUI(),500);
+}
+function resetOverrides(tplId){delete state.ui.sectionOverrides[tplId];persistUI();render();toast('Sections reset');}
+async function saveCurrentDoc(){
+ const tplId=state.ui.selectedTemplateId||'idd';
+ const tpl=TEMPLATES_BUILTIN.find(t=>t.id===tplId);
+ const doc=newDocumentRec(tplId,state.ui.selectedClientId,state.ui.selectedCaseId);
+ const cl=state.clients.find(c=>c.id===state.ui.selectedClientId);
+ doc.title=(tpl?tpl.name:'Document')+(cl?' — '+(cl.firstName||cl.name||'')+' '+(cl.lastName||''):'');
+ doc.sectionOverrides={...(state.ui.sectionOverrides[tplId]||{})};
+ const ctx=buildContext(doc.clientId,doc.caseId);
+ doc.hash=await sha256(renderFullPaper(tplId,ctx,doc.sectionOverrides));
+ await saveDocumentRec(doc,'document.created','user saved draft');
+ toast('Draft saved');render();
+}
+async function issueCurrentDoc(){
+ const tplId=state.ui.selectedTemplateId||'idd';
+ const tpl=TEMPLATES_BUILTIN.find(t=>t.id===tplId);
+ const doc=newDocumentRec(tplId,state.ui.selectedClientId,state.ui.selectedCaseId);
+ const cl=state.clients.find(c=>c.id===state.ui.selectedClientId);
+ doc.title=(tpl?tpl.name:'Document')+(cl?' — '+(cl.firstName||cl.name||'')+' '+(cl.lastName||''):'');
+ doc.sectionOverrides={...(state.ui.sectionOverrides[tplId]||{})};
+ doc.status='issued';doc.issuedAt=now();
+ const ctx=buildContext(doc.clientId,doc.caseId);
+ doc.hash=await sha256(renderFullPaper(tplId,ctx,doc.sectionOverrides));
+ await saveDocumentRec(doc,'document.issued','user issued document');
+ if(tplId==='esis')emitEsisIssued(doc);
+ toast('Document issued');render();
+}
+function printPaper(){
+ const pp=$('#paperPreview');if(!pp)return;
+ w.document.write(`<!DOCTYPE html><html><head><style>body{font-family:Georgia,serif;font-size:13px;line-height:1.7;color:#1a1611;max-width:780px;margin:40px auto;padding:20px}h1{text-align:center;font-size:22px}h2{font-size:16px;border-bottom:1px solid #ccc;padding-bottom:4px;margin-top:22px}h3{font-size:14px;font-style:italic}table{width:100%;border-collapse:collapse;font-size:12px;margin:10px 0}th,td{border:1px solid #ccc;padding:6px 9px}th{background:#eee;font-weight:700}.clause-locked{background:#f5efe0;border-left:3px solid #8b1a1a;padding:8px 12px;margin:8px 0;font-size:12px;font-style:italic}.clause-locked::before{content:'\\25C6 regulatory clause \\00B7 locked \\00B7 ';font-size:9px;color:#8b1a1a;letter-spacing:0.08em;text-transform:uppercase;font-style:normal}.sig-block{margin-top:30px;display:grid;grid-template-columns:1fr 1fr;gap:30px;font-size:12px}.sig-line{border-bottom:1px solid #000;min-height:38px;margin-bottom:4px}.placeholder-empty{background:#ffe9b3;color:#8b1a1a;padding:0 4px;font-weight:700}@media print{body{margin:0;padding:15mm}}</style></head><body>${pp.innerHTML}</body></html>`);
+ w.document.close();w.focus();setTimeout(()=>w.print(),400);
+}
+function copyPaperText(){
+ const pp=$('#paperPreview');if(!pp)return;
+ navigator.clipboard.writeText(pp.innerText).then(()=>toast('Copied')).catch(()=>toast('Copy failed'));
+}
+// ════════════════════════
+// LIBRARY
+// ════════════════════════
+function renderLibrary(v){
+ const docs=state.documents.slice().sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
+ const fS=state.ui.libFilterStatus;
+ const filtered=fS?docs.filter(d=>d.status===fS):docs;
+ v.innerHTML=`
+ <div class="section-h"><h2>Document Library</h2><div class="sub">${docs.length} documents</div></div>
+ <div style="display:flex;gap:6px;margin-bottom:14px">
+ <button class="btn sm ${!fS?'primary':'ghost'}" onclick="filterLib('')">All</button>
+ <button class="btn sm ${fS==='draft'?'primary':'ghost'}" onclick="filterLib('draft')">Draft</button>
+ <button class="btn sm ${fS==='issued'?'primary':'ghost'}" onclick="filterLib('issued')">Issued</button>
+ </div>
+ ${filtered.length?`<table><thead><tr><th>Title</th><th>Kind</th><th>Client</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>${
+ filtered.map(d=>{const tpl=TEMPLATES_BUILTIN.find(t=>t.id===d.tplId);const cl=state.clients.find(c=>c.id===d.clientId);
+ return `<tr><td style="cursor:pointer" onclick="openDocument('${d.id}')">${esc(d.title||tpl?.name||d.tplId)}</td><td><span class="tag">${esc(tpl?.kind||'')}</span></td><td>${esc((cl?.firstName||cl?.name||'')+' '+(cl?.lastName||''))}</td><td><span class="pill ${d.status}">${d.status}</span></td><td>${dateStr(d.createdAt)}</td><td><button class="btn sm ghost" onclick="viewDocPaper('${d.id}')">View</button> <button class="btn sm danger" onclick="if(confirm('Delete?')){deleteDocumentRec('${d.id}');render();}">✕</button></td></tr>`;}).join('')
+ }</tbody></table>`:'<div class="empty"><h3>No documents</h3></div>'}`;
+}
+function filterLib(s){state.ui.libFilterStatus=s;persistUI();render();}
+function openDocument(docId){
+ const doc=state.documents.find(d=>d.id===docId);if(!doc)return;
+ state.ui.selectedTemplateId=doc.tplId;state.ui.selectedClientId=doc.clientId||null;state.ui.selectedCaseId=doc.caseId||null;
+ if(doc.sectionOverrides){if(!state.ui.sectionOverrides[doc.tplId])state.ui.sectionOverrides[doc.tplId]={};Object.assign(state.ui.sectionOverrides[doc.tplId],doc.sectionOverrides);}
+ state.active='generate';persistUI();render();
+}
+function viewDocPaper(docId){
+ const doc=state.documents.find(d=>d.id===docId);if(!doc)return;
+ const ctx=buildContext(doc.clientId,doc.caseId);
+ const html=renderFullPaper(doc.tplId,ctx,doc.sectionOverrides||{});
+ w.document.write(`<!DOCTYPE html><html><head><style>body{font-family:Georgia,serif;font-size:13px;line-height:1.7;color:#1a1611;max-width:780px;margin:40px auto;padding:20px}h1{text-align:center}h2{font-size:16px;border-bottom:1px solid #ccc;padding-bottom:4px;margin-top:22px}h3{font-size:14px;font-style:italic}table{width:100%;border-collapse:collapse;font-size:12px;margin:10px 0}th,td{border:1px solid #ccc;padding:6px 9px}th{background:#eee}.clause-locked{background:#f5efe0;border-left:3px solid #8b1a1a;padding:8px 12px;margin:8px 0;font-size:12px;font-style:italic}.clause-locked::before{content:'\\25C6 regulatory clause \\00B7 locked \\00B7 ';font-size:9px;color:#8b1a1a;text-transform:uppercase;font-style:normal}.sig-block{margin-top:30px;display:grid;grid-template-columns:1fr 1fr;gap:30px;font-size:12px}.sig-line{border-bottom:1px solid #000;min-height:38px;margin-bottom:4px}.placeholder-empty{background:#ffe9b3;color:#8b1a1a;padding:0 4px;font-weight:700}</style></head><body>${html}</body></html>`);
+ w.document.close();
+}
+// ════════════════════════
+// TEMPLATES VIEW
+// ════════════════════════
+function renderTemplatesView(v){
+ const kinds={};TEMPLATES_BUILTIN.forEach(t=>{if(!kinds[t.kind])kinds[t.kind]=[];kinds[t.kind].push(t);});
+ v.innerHTML=`
+ <div class="section-h"><h2>Template Library</h2><div class="sub">${TEMPLATES_BUILTIN.length} MCOB templates</div></div>
+ ${Object.entries(kinds).map(([kind,arr])=>`
+ <h3 style="font-family:var(--mono);font-size:11px;color:var(--brass);letter-spacing:0.1em;text-transform:uppercase;margin:18px 0 8px">${kind}</h3>
+ <div class="tpl-list">${arr.map(t=>`
+ <div class="tpl-row" onclick="useTpl('${t.id}')">
+ <div><div class="nm">${esc(t.name)}</div><div class="sub">${t.sections.length} sections · ${t.sections.filter(s=>s.locked).length} locked · ${esc(t.mcob||'')}</div></div>
+ <span class="tag">${esc(t.kind)}</span>
+ </div>`).join('')}
+ </div>`).join('')}`;
+}
+function useTpl(id){state.ui.selectedTemplateId=id;state.active='generate';persistUI();render();}
+// ════════════════════════
+// FIRM
+// ════════════════════════
+function renderFirm(v){
+ const f=state.firm||{};const fa=f.registeredAddress||{};
+ v.innerHTML=`
+ <div class="section-h"><h2>Firm Setup</h2></div>
+ <div class="card" style="max-width:620px">
+ <div class="row"><div class="field"><label>Firm name</label><input id="fName" value="${esc(f.name||'')}"></div><div class="field"><label>FCA ref</label><input id="fFca" value="${esc(f.fcaRefNo||'')}"></div></div>
+ <div class="row"><div class="field"><label>Address</label><input id="fAddr" value="${esc(fa.line1||f.address||'')}"></div><div class="field"><label>City</label><input id="fCity" value="${esc(fa.city||'')}"></div></div>
+ <div class="row"><div class="field"><label>Postcode</label><input id="fPost" value="${esc(fa.postcode||'')}"></div><div class="field"><label>Email</label><input id="fEmail" value="${esc(f.email||'')}"></div></div>
+ <div class="row"><div class="field"><label>Complaints email</label><input id="fCompEmail" value="${esc(f.complaintsEmail||'')}"></div><div class="field"><label>Phone</label><input id="fPhone" value="${esc(f.phone||'')}"></div></div>
+ <div class="field" style="margin-bottom:10px"><label>Network statement</label><textarea id="fNetStmt" rows="2" style="width:100%">${esc(f.networkStatement||'')}</textarea></div>
+ <button class="btn primary" onclick="saveFirmForm()">Save Firm</button>
+ </div>
+ <div class="section-h" style="margin-top:24px"><h2>Advisers</h2><div class="actions"><button class="btn" onclick="openModal('addadviser')">+ Adviser</button></div></div>
+ ${state.advisers.length?state.advisers.map(a=>`
+ <div class="card" style="max-width:620px;margin-bottom:8px">
+ <div style="display:flex;justify-content:space-between;align-items:center">
+ <div><strong>${esc(a.name)}</strong> <span style="font-family:var(--mono);font-size:10px;color:var(--cream-muted)">${esc(a.fcaRefNo||'')}</span></div>
+ <button class="btn sm ghost" onclick="setActiveAdviser('${a.id}')">${state.ui.activeAdviserId===a.id?'✓ Active':'Set active'}</button>
+ </div>
+ </div>`).join(''):'<div class="empty" style="max-width:620px"><p>No advisers.</p></div>'}`;
+}
+async function saveFirmForm(){
+ const f=state.firm||{id:uid('firm'),ts:now()};
+ f.name=$('#fName').value.trim();f.fcaRefNo=$('#fFca').value.trim();
+ f.registeredAddress={line1:$('#fAddr').value.trim(),city:$('#fCity').value.trim(),postcode:$('#fPost').value.trim()};
+ f.address=$('#fAddr').value.trim();f.email=$('#fEmail').value.trim();
+ f.complaintsEmail=$('#fCompEmail').value.trim();f.phone=$('#fPhone').value.trim();
+ f.networkStatement=$('#fNetStmt').value.trim();f.updatedAt=now();
+ state.firm=f;await idbPut('firms',f);
+ await audit('firm.updated',{reasoning:'firm form saved'});emitFirmUpdate();
+ toast('Firm saved');render();
+}
+function setActiveAdviser(id){state.ui.activeAdviserId=id;persistUI();toast('Active adviser set');render();}
+// ════════════════════════
+// AUDIT
+// ════════════════════════
+function renderAudit(v){
+ const entries=state.audit.slice().reverse().slice(0,200);
+ v.innerHTML=`
+ <div class="section-h"><h2>Audit Chain</h2><div class="sub">${state.audit.length} entries · P3</div><div class="actions"><button class="btn ghost sm" onclick="verifyChain()">Verify</button> <button class="btn ghost sm" onclick="exportAudit()">Export</button></div></div>
+ ${entries.length?entries.map(e=>`<div class="audit-row"><span>${dateTime(e.ts)}</span><span>${esc(e.action)}</span><span>${esc((e.reasoning||'').slice(0,60))}</span><span style="font-family:var(--mono);font-size:9px;color:var(--cream-muted)">${(e.docHash||'').slice(0,12)}…</span></div>`).join(''):'<div class="empty"><p>No audit entries.</p></div>'}`;
+}
+async function verifyChain(){
+ let ok=true;
+ for(let i=0;i<state.audit.length;i++){
+ const e=state.audit[i];const prevHash=i>0?state.audit[i-1].docHash:'';
+ if(e.prevHash!==prevHash){ok=false;break;}
+ const expected=await sha256(JSON.stringify({i:e.i,ts:e.ts,action:e.action,clientId:e.clientId,prevHash:e.prevHash,payload:e.payload}));
+ if(e.docHash!==expected){ok=false;break;}
+ }
+ toast(ok?'Chain verified ✓':'Chain broken — tampering detected');
+}
+function exportAudit(){
+ const blob=new Blob([JSON.stringify(state.audit,null,2)],{type:'application/json'});
+ const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`fallmortgagepaper-audit-${new Date().toISOString().slice(0,10)}.json`;a.click();URL.revokeObjectURL(url);toast('Exported');
+}
+// ════════════════════════
+// HELP — T0 + T3
+// ════════════════════════
+const T0_RULES=[
+ {q:/idd|initial disclosure/i,a:'The Initial Disclosure Document must be provided before any advisory or arranging service (MCOB 4.4A). It discloses your regulatory status, scope of service, fee basis, complaints procedure, and FSCS cover. Use the IDD template in this tool.'},
+ {q:/esis|european standard/i,a:'The ESIS (European Standardised Information Sheet) must be provided to the borrower in good time before they are bound by a mortgage contract (MCOB 5A, MCD Art 14). It replaces the KFI and follows a prescribed 15-section format. Generate it from the ESIS template with case and product data populated.'},
+ {q:/suitability|recommendation/i,a:'Under MCOB 4.7A, you must provide a suitability report setting out: the client\'s circumstances, demands and needs, your recommendation, why it is suitable, alternatives considered, risks, and any procuration fee disclosure. The report must be given before the mortgage contract is entered into.'},
+ {q:/dip|decision in principle/i,a:'A DIP (Decision in Principle / Agreement in Principle) is an informal indication from a lender that they would be willing to lend. It is not a binding offer. It may involve a soft or hard credit check depending on the lender. The DIP template confirms the outcome and next steps.'},
+ {q:/fee|procuration|commission/i,a:'Broker fees must be disclosed before chargeable work commences (MCOB 4.4A.4R). Procuration fees from lenders must be disclosed in the suitability report (MCOB 4.7A.6R) and must not influence the recommendation. The Fee Agreement template formalises the engagement.'},
+ {q:/stress|affordab/i,a:'Under MCOB 11.6.18R, lenders must stress-test affordability at a rate above the pay-rate. Brokers should assess affordability at the lender\'s stress rate and document the result in the suitability report. Include income, expenditure, DTI, and the stressed payment figure.'},
+ {q:/complain|disp|ombudsman/i,a:'Under DISP 1.6.1R, acknowledge complaints within 3 business days. Issue a final response within 8 weeks (DISP 1.6.2R). If unresolved, advise the client of FOS referral rights within 6 months. FOS award limit is £430,000 for acts from April 2024. Use the Complaint/Final Response templates.'},
+ {q:/cooling|cancel|withdraw/i,a:'Under the MCD and MCOB, the borrower has a 7-day reflection period before the mortgage offer can be accepted (MCOB 6A.3.1R). For broker fee agreements, clients have 14 calendar days to cancel per the Consumer Contracts Regulations 2013. Cancellation rights are set out in the ESIS Section 14.'},
+ {q:/product transfer|switch|svr/i,a:'A product transfer (switching to a new product with the same lender) is regulated advice under MCOB if the broker is involved. The broker must assess suitability per MCOB 4.7A.21R. Document why the transfer is suitable vs. remortgaging or reverting to SVR.'},
+ {q:/redemption/i,a:'Request a redemption statement from the current lender when arranging a remortgage. It should show: outstanding balance, accrued interest, ERC if applicable, and any admin/deeds fees. Valid for typically 14-30 days. The Redemption Request template formalises this.'},
+ {q:/retention|record/i,a:'FCA SYSC requires firms to retain records capable of being retrieved for at least 7 years from the end of the business relationship. Mortgage files should include: IDD, Fee Agreement, fact-find, research, suitability report, ESIS, application, offer, and all correspondence.'},
+ {q:/vulnerab/i,a:'FCA FG21/1 requires firms to identify vulnerable customers and respond appropriately. In mortgage advice, consider: financial resilience (income stability, debt burden), health conditions affecting understanding, life events (bereavement, divorce), and capability (literacy, language). Document adjustments made.'},
+];
+function askT0(q){for(const r of T0_RULES){if(r.q.test(q))return {answer:r.a,source:'T0 · MCOB/DISP hard-coded rules'};}return null;}
+async function askT3(q){
+ const keys=[
+ {k:state.settings.anthropicKey,name:'Anthropic',url:'https://api.anthropic.com/v1/messages',
+ body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:800,messages:[{role:'user',content:'You are an expert UK mortgage regulation assistant (MCOB, MCD, FCA). Answer concisely.\n\nQuestion: '+q}]}),
+ headers:{'x-api-key':'KEY','anthropic-version':'2023-06-01','content-type':'application/json'},
+ parse:r=>r.content?.[0]?.text},
+ {k:state.settings.openaiKey,name:'OpenAI',url:'https://api.openai.com/v1/chat/completions',
+ body:JSON.stringify({model:'gpt-4o-mini',max_tokens:800,messages:[{role:'system',content:'You are an expert UK mortgage regulation assistant.'},{role:'user',content:q}]}),
+ headers:{'Authorization':'Bearer KEY','Content-Type':'application/json'},
+ parse:r=>r.choices?.[0]?.message?.content},
+ ];
+ for(const p of keys){
+ if(!p.k)continue;
+ try{const hdrs={};for(const[hk,hv]of Object.entries(p.headers))hdrs[hk]=hv.replace('KEY',p.k);
+ const res=await fetch(p.url,{method:'POST',headers:hdrs,body:p.body});
+ if(!res.ok)continue;const json=await res.json();const text=p.parse(json);
+ if(text)return {answer:text,source:'T3 · '+p.name+' BYOK'};
+ }catch(e){continue;}
+ }
+ return null;
+}
+function renderHelp(v){
+ const msgs=state.ui.chat||[];
+ v.innerHTML=`
+ <div class="section-h"><h2>Mortgage Q & A</h2><div class="sub">T0 rules + T3 BYOK</div></div>
+ <p style="font-size:12px;color:var(--cream-dim);margin-bottom:14px">Ask about IDD, ESIS, suitability, fees, stress testing, complaints, cancellation, product transfers, redemption, record retention, vulnerability.</p>
+ <div class="card" style="max-width:780px">
+ <div class="chat" id="chatBox">${msgs.map(m=>`<div class="msg ${m.role}">${esc(m.text)}${m.source?`<div class="src">${esc(m.source)}</div>`:''}</div>`).join('')}</div>
+ <div class="chat-input">
+ <input id="chatIn" placeholder="Ask about MCOB, MCD, DISP…" onkeydown="if(event.key==='Enter')askQuestion()">
+ <button class="btn primary" onclick="askQuestion()">Ask</button>
+ </div>
+ </div>`;
+ const box=$('#chatBox');if(box)box.scrollTop=box.scrollHeight;
+}
+async function askQuestion(){
+ const inp=$('#chatIn');if(!inp)return;const q=inp.value.trim();if(!q)return;inp.value='';
+ if(!state.ui.chat)state.ui.chat=[];
+ state.ui.chat.push({role:'user',text:q});render();
+ let result=askT0(q);
+ if(!result)result=await askT3(q);
+ state.ui.chat.push(result?{role:'bot',text:result.answer,source:result.source}:{role:'bot',text:'No T0 rule matched and no BYOK key configured. Add a key in Settings.',source:'system'});
+ persistUI();render();
+}
+// ════════════════════════
+// MODALS
+// ════════════════════════
+function openModal(type){
+ const bg=$('#modal');const title=$('#modalTitle');const body=$('#modalBody');
+ bg.classList.add('open');bg.onclick=e=>{if(e.target===bg)closeModal();};
+ if(type==='settings'){
+ title.textContent='Settings';
+ body.innerHTML=`
+ <div class="field" style="margin-bottom:10px"><label>Brand name</label><input id="sBrand" value="${esc(state.brandName)}" style="width:100%"></div>
+ <div class="field" style="margin-bottom:10px"><label>Anthropic key</label><input id="sAnthro" type="password" value="${esc(state.settings.anthropicKey||'')}" style="width:100%"></div>
+ <div class="field" style="margin-bottom:10px"><label>OpenAI key</label><input id="sOpenai" type="password" value="${esc(state.settings.openaiKey||'')}" style="width:100%"></div>
+ <div style="margin:14px 0"><label style="font-size:12px"><input type="checkbox" id="sAudit" ${state.settings.auditChain?'checked':''}> Audit chain</label></div>
+ <div style="margin:10px 0"><label style="font-size:12px"><input type="checkbox" id="sBc" ${state.settings.autoBroadcast?'checked':''}> Auto-broadcast</label></div>
+ <hr style="border-color:var(--line);margin:14px 0">
+ <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn ghost sm" onclick="exportState()">Export</button><button class="btn ghost sm" onclick="importState()">Import</button><button class="btn danger sm" onclick="wipeState()">Wipe</button></div>
+ <div class="actions"><button class="btn primary" onclick="saveSettings()">Save</button> <button class="btn ghost" onclick="closeModal()">Cancel</button></div>`;
+ }else if(type==='addclient'){
+ title.textContent='Add Client';
+ body.innerHTML=`
+ <div class="row"><div class="field"><label>Title</label><select id="acTitle" style="width:100%"><option>Mr</option><option>Mrs</option><option>Ms</option><option>Miss</option><option>Dr</option></select></div><div class="field"><label>First name</label><input id="acFirst" style="width:100%"></div></div>
+ <div class="row"><div class="field"><label>Last name</label><input id="acLast" style="width:100%"></div><div class="field"><label>Address</label><input id="acAddr" style="width:100%"></div></div>
+ <div class="actions"><button class="btn primary" onclick="saveNewClient()">Add</button> <button class="btn ghost" onclick="closeModal()">Cancel</button></div>`;
+ }else if(type==='addadviser'){
+ title.textContent='Add Adviser';
+ body.innerHTML=`
+ <div class="row"><div class="field"><label>Name</label><input id="aaName" style="width:100%"></div><div class="field"><label>FCA ref</label><input id="aaFca" style="width:100%"></div></div>
+ <div class="row"><div class="field"><label>Email</label><input id="aaEmail" style="width:100%"></div><div class="field"><label>Phone</label><input id="aaPhone" style="width:100%"></div></div>
+ <div class="field" style="margin-bottom:10px"><label>Scope statement</label><input id="aaScope" value="We search the whole of market." style="width:100%"></div>
+ <div class="actions"><button class="btn primary" onclick="saveNewAdviser()">Add</button> <button class="btn ghost" onclick="closeModal()">Cancel</button></div>`;
+ }else if(type==='addcase'){
+ title.textContent='Add Case';
+ body.innerHTML=`
+ <div class="row"><div class="field"><label>Client</label><select id="acCl" style="width:100%"><option value="">—</option>${state.clients.filter(c=>!c.archivedAt).map(c=>`<option value="${c.id}">${esc((c.firstName||c.name||'')+' '+(c.lastName||''))}</option>`).join('')}</select></div><div class="field"><label>Reference</label><input id="acRef" style="width:100%" placeholder="MC-2026-001"></div></div>
+ <div class="row"><div class="field"><label>Type</label><select id="acType" style="width:100%"><option value="purchase">Purchase</option><option value="remortgage">Remortgage</option><option value="product-transfer">Product Transfer</option><option value="buy-to-let">Buy to Let</option><option value="shared-ownership">Shared Ownership</option><option value="right-to-buy">Right to Buy</option></select></div><div class="field"><label>Property address</label><input id="acProp" style="width:100%"></div></div>
+ <div class="row"><div class="field"><label>Loan amount</label><input type="number" id="acLoan" style="width:100%"></div><div class="field"><label>Term (years)</label><input type="number" id="acTerm" value="25" style="width:100%"></div></div>
+ <div class="row"><div class="field"><label>Lender</label><input id="acLender" style="width:100%"></div><div class="field"><label>Rate %</label><input type="number" step="0.01" id="acRate" style="width:100%"></div></div>
+ <div class="actions"><button class="btn primary" onclick="saveNewCase()">Add</button> <button class="btn ghost" onclick="closeModal()">Cancel</button></div>`;
+ }
+}
+function closeModal(){$('#modal').classList.remove('open');}
+async function saveNewClient(){
+ const c={id:uid('cl'),ts:now(),updatedAt:now(),title:$('#acTitle').value,firstName:$('#acFirst').value.trim(),lastName:$('#acLast').value.trim(),name:$('#acFirst').value.trim()+' '+$('#acLast').value.trim(),address:$('#acAddr').value.trim(),archivedAt:null};
+ if(!c.firstName){toast('First name required');return;}
+ state.clients.push(c);await idbPut('clients',c);
+ await audit('client.created',{clientId:c.id,reasoning:'manual add'});emitClientUpdate(c);
+ closeModal();toast('Client added');render();
+}
+async function saveNewAdviser(){
+ const a={id:uid('adv'),ts:now(),updatedAt:now(),name:$('#aaName').value.trim(),fcaRefNo:$('#aaFca').value.trim(),email:$('#aaEmail').value.trim(),phone:$('#aaPhone').value.trim(),scopeStatement:$('#aaScope').value.trim(),scopeShort:'whole of market',smcrRole:'CF1'};
+ if(!a.name){toast('Name required');return;}
+ state.advisers.push(a);if(!state.ui.activeAdviserId)state.ui.activeAdviserId=a.id;
+ await idbPut('advisers',a);await audit('adviser.created',{reasoning:'manual add'});
+ closeModal();toast('Adviser added');render();
+}
+async function saveNewCase(){
+ const cs={id:uid('mc'),ts:now(),updatedAt:now(),clientId:$('#acCl').value||'',ref:$('#acRef').value.trim()||'MC-'+new Date().getFullYear()+'-'+String(state.cases.length+1).padStart(3,'0'),type:$('#acType').value,status:'enquiry',
+ property:{address:$('#acProp').value.trim(),postcode:''},
+ loan:{amount:parseFloat($('#acLoan').value)||0,term:parseInt($('#acTerm').value)||25,repayment:'capital & interest',ltv:'',monthlyPayment:'',productCode:''},
+ product:{lender:$('#acLender').value.trim(),type:'fixed',rate:parseFloat($('#acRate').value)||0,period:2},
+ affordability:{dependants:0,expenditure:'',dti:'',stressRate:''},
+ fees:{broker:'',brokerStatement:'',brokerWhen:'on application',refundPolicy:'Non-refundable after application submission.'},
+ esis:{aprc:'',revertRate:'',productFee:'0',ercSummary:'',valuationFee:'0'},
+ recommendation:{rationale:'',alternativesConsidered:''},
+ procurationFee:'',
+ };
+ state.cases.push(cs);await idbPut('cases',cs);
+ await audit('case.created',{clientId:cs.clientId,reasoning:'manual add',payload:{caseId:cs.id}});
+ closeModal();toast('Case added');render();
+}
+function saveSettings(){
+ state.brandName=$('#sBrand').value.trim()||'FallMortgagePaper';
+ state.settings.anthropicKey=$('#sAnthro').value.trim();
+ state.settings.openaiKey=$('#sOpenai').value.trim();
+ state.settings.auditChain=$('#sAudit').checked;
+ state.settings.autoBroadcast=$('#sBc').checked;
+ $('#tierBadge').textContent=state.settings.anthropicKey||state.settings.openaiKey?'T3':'T0';
+ persistUI();closeModal();toast('Settings saved');render();
+}
+function exportState(){
+ const payload={tool:TOOLNAME,version:VERSION,exportedAt:now(),firm:state.firm,advisers:state.advisers,clients:state.clients,cases:state.cases,documents:state.documents};
+ const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+ const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`fallmortgagepaper-export.json`;a.click();URL.revokeObjectURL(url);toast('Exported');
+}
+function importState(){
+ const inp=document.createElement('input');inp.type='file';inp.accept='.json';
+ inp.onchange=async()=>{const f=inp.files[0];if(!f)return;try{const data=JSON.parse(await f.text());
+ if(data.firm){state.firm=data.firm;await idbPut('firms',data.firm);}
+ for(const arr of ['advisers','clients','cases','documents']){if(Array.isArray(data[arr]))for(const r of data[arr]){state[arr].push(r);await idbPut(arr,r);}}
+ await persistUI();toast('Imported');render();
+ }catch(e){toast('Import failed');}};inp.click();
+}
+async function wipeState(){
+ if(!confirm('Wipe ALL data?'))return;if(!confirm('Are you absolutely sure?'))return;
+ for(const s of ['firms','advisers','clients','cases','documents','templates','audit','state']){const tx=db.transaction(s,'readwrite');tx.objectStore(s).clear();await new Promise(r=>{tx.oncomplete=r;});}
+ state={active:'dashboard',brandName:'FallMortgagePaper',firm:null,advisers:[],clients:[],cases:[],documents:[],templates:[],audit:[],
+ ui:{selectedClientId:null,selectedCaseId:null,selectedTemplateId:'idd',selectedDocumentId:null,activeAdviserId:null,libFilterClient:'',libFilterTpl:'',libFilterStatus:'',sectionOverrides:{},extraContext:{},chat:[]},
+ settings:{anthropicKey:'',auditChain:true,autoBroadcast:true}};
+ toast('Wiped');render();
+}
+// ════════════════════════
+// DEMO SEED
+// ════════════════════════
+async function seedDemoIfEmpty(){
+ if(state.clients.length||state.advisers.length||state.firm)return;
+ const firmId=uid('firm');
+ const firm={id:firmId,name:'Demo Mortgages Ltd',fcaRefNo:'789012',registeredAddress:{line1:'10 Demo Lane',city:'London',postcode:'SW1A 1AA'},address:'10 Demo Lane, London',email:'info@demomortgages.co.uk',complaintsEmail:'complaints@demomortgages.co.uk',phone:'020 7987 6543',networkStatement:'We are directly authorised by the FCA.',updatedAt:now(),isDemo:true};
+ state.firm=firm;await idbPut('firms',firm);
+ const advId=uid('adv');
+ const adv={id:advId,firmId,name:'Demo Adviser',fcaRefNo:'ADV002',email:'adviser@demomortgages.co.uk',phone:'07700 900123',scopeStatement:'We search the whole of market including direct-only lenders via sourcing systems.',scopeShort:'whole of market',smcrRole:'CF1',updatedAt:now(),isDemo:true};
+ state.advisers.push(adv);state.ui.activeAdviserId=advId;await idbPut('advisers',adv);
+ const clId=uid('cl');
+ const client={id:clId,title:'Mr',firstName:'James',lastName:'Patterson',name:'James Patterson',address:'42 Oak Road, Manchester M20 3AB',age:34,creditHistoryNotes:'Clean — no adverse. On electoral roll.',archivedAt:null,ts:now(),updatedAt:now(),isDemo:true};
+ state.clients.push(client);await idbPut('clients',client);
+ const csId=uid('mc');
+ const mc={id:csId,clientId:clId,ts:now(),updatedAt:now(),ref:'MC-2026-001',type:'purchase',status:'dip-obtained',
+ property:{address:'15 Elm Avenue, Manchester M21 9QR',postcode:'M21 9QR'},
+ loan:{amount:280000,term:30,repayment:'capital & interest',ltv:85,monthlyPayment:1247,productCode:'NW-FIX-2Y-85'},
+ product:{lender:'Nationwide',type:'fixed',rate:4.29,period:2},
+ affordability:{dependants:0,expenditure:1800,dti:32,stressRate:7.5},
+ fees:{broker:499,brokerStatement:'A fixed fee of £499, payable on full application submission.',brokerWhen:'on full application submission',refundPolicy:'Non-refundable after application submission. No fee payable if application is not submitted.'},
+ esis:{aprc:6.1,revertRate:7.99,productFee:999,ercSummary:'2% year 1, 1% year 2',valuationFee:0},
+ recommendation:{rationale:'Nationwide 2-year fixed at 4.29% offers the best combination of rate, fee, and ERC exposure for Mr Patterson\'s 30-year purchase. The £0 valuation fee and free legals (remortgage equivalent) offset the £999 product fee.',alternativesConsidered:'Barclays 2-yr fixed 4.19% (lower rate but £1,499 product fee, net cost higher over 2 years). HSBC 5-yr fixed 4.59% (more payment certainty but higher rate and 5-year ERC tie-in, which Mr Patterson prefers to avoid given potential relocation in 3 years). Halifax tracker (lower initial rate but payment uncertainty incompatible with stated need for budgeting certainty).'},
+ procurationFee:840,isDemo:true};
+ state.cases.push(mc);await idbPut('cases',mc);
+ state.ui.selectedClientId=clId;state.ui.selectedCaseId=csId;
+ await audit('demo.seeded',{reasoning:'first boot',payload:{firmId,advId,clId,csId}});
+ await persistUI();
+}
+// ════════════════════════
+// BOOT
+// ════════════════════════
+(async function boot(){
+ try{
+ await openDB();await loadAll();await seedDemoIfEmpty();initMesh();
+ $('#tierBadge').textContent=state.settings.anthropicKey||state.settings.openaiKey?'T3':'T0';
+ render();
+ }catch(e){
+ console.error('[fallmortgagepaper] boot error:',e);
+ }
+})();
+
+// Named exports for the primary API surface
+export { loadConfig };
+export { saveConfig };
+export { $ };
+export { esc };
+export { aiTier };
+export { renderAiChip };
+export { loadWebLLM };
+export { aiComplete };
+export { aiCloudCall };
+export { meshStart };
+
+export { FALL_KIT_VERSION };
+export { KCC_MINT_URL };
+export { WEBLLM_MODELS };
+export { DEFAULT_MODEL };
+export { T3_PROVIDERS };
+export { STATE };
+export { MESH_CHANNEL };
+export { STUN_SERVERS };
+export { TOOLNAME };
+export { VERSION };

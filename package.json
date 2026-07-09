@@ -1,0 +1,24 @@
+{
+  "name": "@ai-native-solutions/fallmortgagepaper-sdk",
+  "version": "1.0.0",
+  "description": "fallmortgagepaper SDK · sovereign single-file library extracted from fallmortgagepaper/index.html",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "files": ["src", "docs", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test test/",
+    "smoke": "node examples/smoke.js"
+  },
+  "keywords": ["fallmortgagepaper", "sdk", "sovereign", "ai-native-solutions"],
+  "author": "AI-Native Solutions",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sjgant80-hub/fallmortgagepaper-sdk.git"
+  },
+  "homepage": "https://sjgant80-hub.github.io/fallmortgagepaper-sdk/",
+  "publishConfig": {
+    "access": "public"
+  }
+}
